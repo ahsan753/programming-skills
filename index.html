@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<script>try{var _t=localStorage.getItem("ps-theme");if(_t==="light"||_t==="dark")document.documentElement.dataset.theme=_t;}catch(e){}</script>
 <style>
 /* ===== Bright & playful theme ===== */
 :root{
@@ -378,10 +379,16 @@ canvas.confetti{position:fixed;inset:0;pointer-events:none;z-index:80}
 .panel ul.mps{padding-left:0;margin:0}
 @container (max-width:1000px){.lc .codepair{grid-template-columns:1fr}}
 
+/* ===== theme toggle button ===== */
+.themebtn{flex:none;display:grid;place-items:center;width:40px;height:40px;border-radius:12px;border:2px solid var(--rule-2);background:var(--paper);font-size:1.15rem;line-height:1;box-shadow:0 3px 0 var(--rule-2);transition:transform .06s, box-shadow .06s}
+.themebtn:hover{filter:brightness(1.03)}
+.themebtn:active{transform:translateY(2px);box-shadow:0 1px 0 var(--rule-2)}
+@media (max-width:420px){.themebtn{width:36px;height:36px;font-size:1.05rem}}
+
 </style>
 </head>
 <body>
-<header class="top"><div class="wrap"><a class="brand" href="#"><span class="logo">{ }</span><span>Programming Skills<small>Cambridge IGCSE CS 0984</small></span></a><span class="spacer"></span><div id="hud" class="hud"></div></div></header>
+<header class="top"><div class="wrap"><a class="brand" href="#"><span class="logo">{ }</span><span>Programming Skills<small>Cambridge IGCSE CS 0984</small></span></a><span class="spacer"></span><button id="themebtn" class="themebtn" type="button" aria-label="Switch colour theme" title="Switch between light and dark">🌙</button><div id="hud" class="hud"></div></div></header>
 <div class="wrap"><p id="previewnotice" class="note" hidden>Teacher preview: stages are unlocked. XP, streaks and badges are disabled; student progress is not saved or changed. <a href="?">Return to student mode</a></p><p id="savewarning" class="errbox" role="alert" hidden>Progress could not be saved in this browser. Keep this tab open and copy your progress before leaving.</p></div>
 <main class="wrap" id="app"></main>
 <footer class="wrap foot">Mapped to the Cambridge IGCSE (9–1) Computer Science 0984 syllabus for 2026–2028. Your code runs in your browser and is not sent anywhere. Progress is saved on this device only.</footer>
@@ -1503,7 +1510,7 @@ DECLARE IsRaining   : BOOLEAN`,
   ],
 
   apply:[
-    {id:"a1", marks:6, title:"Account sign-up", context:"Tech",
+    {id:"a1", marks:7, title:"Account sign-up", context:"Tech",
      brief:`<p>Write a Python program for a new‑account form that:</p>
       <ul><li>asks for a <b>username</b> and keeps it as <b>text</b></li>
       <li>asks for the user's <b>age</b> in whole years (a whole number)</li>
@@ -1552,7 +1559,12 @@ OUTPUT Username, ", age ", Age, " averages ", ScreenTime, " hours a day"`},
        const keepsDecimal=!run2.error&&H.outHas(run2,"2.0");
        pts.push(ok&&keepsDecimal? H.yes("The summary shows all three values","8.1.3","Your summary includes the username, the age and the screen time — and 2 shows as 2.0 because it's REAL.")
          : H.no("The summary shows all three values","8.1.3", run.error?"Your program stopped with an error — see above.": !ok?`We expected to see <b>striker99</b>, <b>16</b> and <b>3.5</b>. Your output: <code>${H.e(H.printed(run).trim()||"(nothing)")}</code>`:"Nearly — a whole-number screen time should still print as 2.0 because it is REAL. Use float()."));
-       pts.push(H.commentPoint(info, H.attempted(pts)));
+       const attempted=H.attempted(pts);
+       pts.push(H.identPoint(info,{attempted, hint:"username, age, screen_time", roles:[
+         {name:(i0||{}).var||null, ok:/user|name|account|login|handle/i, label:"username", examples:"username"},
+         {name:(i1||{}).var||null, ok:/age/i, label:"age", examples:"age"},
+         {name:(i2||{}).var||null, ok:/screen|time|hour|usage|daily/i, label:"screen time", examples:"screen_time"}]}));
+       pts.push(H.commentPoint(info, attempted));
        return pts;
      }},
 
@@ -1768,7 +1780,7 @@ name = input("Your name: ")`,
   ],
 
   apply:[
-    {id:"a1", marks:5, title:"Two-day step count", context:"Fitness",
+    {id:"a1", marks:6, title:"Two-day step count", context:"Fitness",
      brief:`<p>Write a Python program that, <b>in this order</b>:</p>
       <ul><li>asks for the number of steps on <b>day 1</b> (a whole number)</li>
       <li>asks for the number of steps on <b>day 2</b> (a whole number)</li>
@@ -1817,7 +1829,13 @@ OUTPUT "Average: ", Average, " steps a day"`},
        const bothMsgs=!r1.error&&/[A-Za-z]{3,}/.test(H.printed(r1).replace(/\d/g,""));
        pts.push(bothMsgs? H.yes("Both outputs have a message","8.1.3","Your outputs explain the numbers.")
          : H.no("Both outputs have a message","8.1.3","Output a message with each number, e.g. <code>Total: 15000 steps</code>."));
-       pts.push(H.commentPoint(info, H.attempted(pts)));
+       const attempted=H.attempted(pts);
+       const avgVar=(info.assigns.find(a=>/average|avg|mean/i.test(a.name))||{}).name||null;
+       pts.push(H.identPoint(info,{attempted, hint:"day1, day2, average", roles:[
+         {name:(info.inputs[0]||{}).var||null, ok:/day|step/i, label:"first day's steps", examples:"day1"},
+         {name:(info.inputs[1]||{}).var||null, ok:/day|step/i, label:"second day's steps", examples:"day2"},
+         {name:avgVar, ok:/average|avg|mean/i, label:"average", examples:"average"}]}));
+       pts.push(H.commentPoint(info, attempted));
        return pts;
      }},
 
@@ -1853,8 +1871,9 @@ OUTPUT "Total: ", Total, " QAR"`},
      mark(R){
        const {info,H}=R, pts=[], r1=R.runs[0], r2=R.runs[1];
        const nameErr=r=>r.error&&r.error.type==="NameError";
-       pts.push(!nameErr(r1)&&!nameErr(r2)? H.yes("No value is used before it is set","8.1.4a","Every value is created before it is used — the order is right.")
-         : H.no("No value is used before it is set","8.1.4a","Python still hits a value that doesn't exist yet. Move each line so the values it needs are set above it."));
+       const attempts=info.inputs.length>=1;   // an off-task program that reads no input isn't sequencing this task
+       pts.push(attempts&&!nameErr(r1)&&!nameErr(r2)? H.yes("No value is used before it is set","8.1.4a","Every value is created before it is used — the order is right.")
+         : H.no("No value is used before it is set","8.1.4a", attempts?"Python still hits a value that doesn't exist yet. Move each line so the values it needs are set above it.":"Keep the program's lines (including the input) and put them in the right order."));
        pts.push(!r1.error&&H.outHas(r1,"total:")? H.yes("The total is output with a message","8.1.3","The total is printed with its label.")
          : H.no("The total is output with a message","8.1.3", r1.error?"Fix the order first — the program crashes before it prints.":"Output the total with a message, e.g. <code>Total: 12 QAR</code>."));
        pts.push(!r1.error&&H.hasNum(r1,12)? H.yes("Correct total for 4 slices","8.1.4a","3 × 4 = 12.")
@@ -2010,7 +2029,7 @@ print((6 + 4) * 2)`,
   ],
 
   apply:[
-    {id:"a1", marks:5, title:"Seconds to minutes", context:"Tech",
+    {id:"a1", marks:6, title:"Seconds to minutes", context:"Tech",
      brief:`<p>A stopwatch app stores a time as a whole number of <b>seconds</b>. Write a Python program that:</p>
       <ul><li>asks for a number of seconds (a whole number)</li>
       <li>works out the whole <b>minutes</b> using integer division</li>
@@ -2051,7 +2070,14 @@ OUTPUT Total, " seconds is ", Minutes, " minutes and ", Seconds, " seconds"`},
        const ok=!r1.error&&H.numsInOrder(r1,[125,2,5])&&!r2.error&&H.numsInOrder(r2,[90,1,30])&&!r3.error&&H.numsInOrder(r3,[60,1,0]);
        pts.push(ok? H.yes("Correct minutes and seconds for every test","8.1.4f","125→2 and 5, 90→1 and 30, 60→1 and 0.")
          : H.no("Correct minutes and seconds for every test","8.1.4f", r1.error?"Your program stopped with an error — see above.":`We expected 2 minutes and 5 seconds for 125. Your output: <code>${H.e(H.printed(r1).trim()||"(nothing)")}</code>`));
-       pts.push(H.commentPoint(info, H.attempted(pts)));
+       const attempted=H.attempted(pts);
+       const minVar=(info.assigns.find(a=>/min/i.test(a.name))||{}).name||null;
+       const secVar=(info.assigns.find(a=>/sec/i.test(a.name))||{}).name||null;
+       pts.push(H.identPoint(info,{attempted, hint:"total, minutes, seconds", roles:[
+         {name:(info.inputs[0]||{}).var||null, ok:/second|total|time|secs/i, label:"total seconds", examples:"total"},
+         {name:minVar, ok:/min/i, label:"minutes", examples:"minutes"},
+         {name:secVar, ok:/sec/i, label:"seconds left over", examples:"seconds"}]}));
+       pts.push(H.commentPoint(info, attempted));
        return pts;
      }},
 
@@ -2245,7 +2271,7 @@ OUTPUT Stock = 0`,
   ],
 
   apply:[
-    {id:"a1", title:"High score check", context:"Gaming", marks:5,
+    {id:"a1", title:"High score check", context:"Gaming", marks:6,
      brief:`<p>Write a Python program that compares a new score with the current high score. It should:</p>
       <ul><li>ask for the <b>current high score</b> (a whole number)</li>
       <li>ask for the player's <b>new score</b> (a whole number)</li>
@@ -2291,7 +2317,11 @@ OUTPUT "Equal to the high score: ", New = High`},
               &&!r3.error&&/true/i.test((eq(r3)||[])[1]||"");
        pts.push(ok? H.yes("Correct True/False for every test","8.1.4f","120 beats 100 (True); 100 = 100 gives Equal True.")
          : H.no("Correct True/False for every test","8.1.4f", r1.error?"Your program stopped with an error — see above.":`Check your two comparisons. For 120 vs 100 we expect Beats True, Equal False. Your output: <code>${H.e(H.printed(r1).trim()||"(nothing)")}</code>`));
-       pts.push(H.commentPoint(info, H.attempted(pts)));
+       const attempted=H.attempted(pts);
+       pts.push(H.identPoint(info,{attempted, hint:"high, new", roles:[
+         {name:(info.inputs[0]||{}).var||null, ok:/high|record|best|top/i, label:"high score", examples:"high"},
+         {name:(info.inputs[1]||{}).var||null, ok:/new|score|your|player|current/i, label:"new score", examples:"new"}]}));
+       pts.push(H.commentPoint(info, attempted));
        return pts;
      }},
 
@@ -2472,7 +2502,7 @@ print(not age >= 18)`,
   ],
 
   apply:[
-    {id:"a1", title:"Entry rules", context:"Tech", marks:5,
+    {id:"a1", title:"Entry rules", context:"Tech", marks:6,
      brief:`<p>A theme-park app checks a visitor's age. Write a Python program that:</p>
       <ul><li>asks for the visitor's <b>age</b> (a whole number)</li>
       <li>outputs whether they get <b>free entry</b> — under 5 <b>or</b> 65 and over: <code>print(age &lt; 5 or age &gt;= 65)</code></li>
@@ -2512,7 +2542,10 @@ OUTPUT "Teenager: ", Age >= 13 AND Age <= 19`},
          : H.no("Teenager is correct (13 to 19)","8.1.4f","Teenager should be True only for 15. Use <code>age &gt;= 13 and age &lt;= 19</code> — both ends, so AND."));
        pts.push(H.usesOp(info,"and")&&H.usesOp(info,"or")? H.yes("Uses both AND and OR","8.1.4f","One condition needs AND, the other OR.")
          : H.no("Uses both AND and OR","8.1.4f","This task needs an <code>and</code> (teenager range) and an <code>or</code> (free entry)."));
-       pts.push(H.commentPoint(info, H.attempted(pts)));
+       const attempted=H.attempted(pts);
+       pts.push(H.identPoint(info,{attempted, hint:"age", roles:[
+         {name:(info.inputs[0]||{}).var||null, ok:/age|years/i, label:"age", examples:"age"}]}));
+       pts.push(H.commentPoint(info, attempted));
        return pts;
      }},
 
@@ -3516,6 +3549,33 @@ function ckTrace(q, box, record){
       <ul class="mps">${pts.map(x=>`<li class="mp ${x.ok?"ok":"no"}"><span class="ic">${x.ok?"✓":"✗"}</span><span><span class="mt">${x.t}</span><br><span class="mf">${x.fb}</span></span></li>`).join("")}</ul>`;
   };
 }
+
+/* ---------- colour theme toggle (per-viewer convenience) ---------- */
+function effectiveTheme(){
+  const t = document.documentElement.dataset.theme;
+  if (t==="light" || t==="dark") return t;
+  try { return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"; } catch(e){ return "light"; }
+}
+function paintThemeButton(){
+  const b = document.getElementById("themebtn"); if (!b) return;
+  const dark = effectiveTheme()==="dark";
+  b.textContent = dark ? "☀️" : "🌙";
+  b.title = dark ? "Switch to light mode" : "Switch to dark mode";
+  b.setAttribute("aria-label", b.title);
+}
+function initTheme(){
+  const b = document.getElementById("themebtn"); if (!b) return;
+  paintThemeButton();
+  b.addEventListener("click", ()=>{
+    const next = effectiveTheme()==="dark" ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem("ps-theme", next); } catch(e){}
+    paintThemeButton();
+  });
+  // If the viewer hasn't chosen, follow the device and keep the icon in step.
+  try { matchMedia("(prefers-color-scheme: dark)").addEventListener("change", ()=>{ if(!document.documentElement.dataset.theme) paintThemeButton(); }); } catch(e){}
+}
+initTheme();
 
 route();
 
