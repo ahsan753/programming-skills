@@ -451,7 +451,8 @@ def analyse(src):
     tree = ast.parse(src)
     info = {"assigns": [], "inputs": [], "comments": 0, "names": [],
             "numLiterals": [], "strLiterals": [], "calls": [], "ops": [],
-            "lines": len(src.splitlines())}
+            "constructs": [], "hasElse": False, "hasElif": False,
+            "nested": False, "lines": len(src.splitlines())}
     try:
         for tok in tokenize.generate_tokens(io.StringIO(src).readline):
             if tok.type == tokenize.COMMENT and tok.string.strip("# ").strip():
@@ -513,6 +514,18 @@ def analyse(src):
                 info["numLiterals"].append({"value": v, "line": node.lineno, "bareAssign": bare})
             elif isinstance(v, str):
                 info["strLiterals"].append(v)
+        if isinstance(node, ast.If):
+            info["constructs"].append("if")
+            if node.orelse:
+                # elif is encoded as a single If inside orelse; a real else has other statements
+                if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
+                    info["hasElif"] = True
+                else:
+                    info["hasElse"] = True
+        elif isinstance(node, ast.For):
+            info["constructs"].append("for")
+        elif isinstance(node, ast.While):
+            info["constructs"].append("while")
         if isinstance(node, ast.BinOp):
             info["ops"].append(_BINOP.get(type(node.op), "?"))
         elif isinstance(node, ast.Compare):
@@ -523,6 +536,23 @@ def analyse(src):
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
             info["ops"].append("not")
     info["ops"] = sorted(set(info["ops"]))
+    info["constructs"] = sorted(set(info["constructs"]))
+    # Nesting (8.1.5): a control statement that contains another control statement in its
+    # body. An elif (single If inside orelse) is a continuation of the same selection, not
+    # nesting, so it is excluded.
+    CTRL = (ast.If, ast.For, ast.While)
+    for node in ast.walk(tree):
+        if not isinstance(node, CTRL):
+            continue
+        bodies = [node.body]
+        if isinstance(node, ast.If):
+            if not (len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If)):
+                bodies.append(node.orelse)
+        else:
+            bodies.append(node.orelse)
+        if any(isinstance(s, CTRL) for b in bodies for s in b):
+            info["nested"] = True
+            break
     # ast.walk is breadth-first, so put everything back into source order
     info["inputs"].sort(key=lambda d: d["line"])
     info["assigns"].sort(key=lambda d: d["line"])
@@ -643,9 +673,9 @@ const SKILL_MAP = [
     [6,"Relational operators","8.1.4(f)","s6"],
     [7,"Logical operators","8.1.4(f)","s7"]]},
   {g:"B", title:"Control structures", ref:"8.1.4–8.1.5", items:[
-    [8,"Selection with IF","8.1.4(b)"],[9,"Selection with CASE","8.1.4(b)"],
-    [10,"Count-controlled loops (FOR)","8.1.4(c)"],[11,"Pre-condition loops (WHILE)","8.1.4(c)"],
-    [12,"Post-condition loops (REPEAT)","8.1.4(c)"],[13,"Nested statements","8.1.5"]]},
+    [8,"Selection with IF","8.1.4(b)","s8"],[9,"Selection with CASE","8.1.4(b)","s9"],
+    [10,"Count-controlled loops (FOR)","8.1.4(c)","s10"],[11,"Pre-condition loops (WHILE)","8.1.4(c)","s11"],
+    [12,"Post-condition loops (REPEAT)","8.1.4(c)","s12"],[13,"Nested statements","8.1.5","s13"]]},
   {g:"C", title:"Strings and library routines", ref:"8.1.4(e), 8.1.7", items:[
     [14,"String handling","8.1.4(e)"],[15,"Library routines","8.1.7"]]},
   {g:"D", title:"Subroutines", ref:"8.1.6, 8.1.8", items:[
@@ -693,12 +723,12 @@ OUTPUT Score`,
      py:`MAX_LIVES = 3          # constant: UPPER_CASE, set once
 lives = MAX_LIVES      # variable: starts at 3...
 lives = lives - 1      # ...and changes during the game`,
-     pc:`CONSTANT MaxLives ← 3
+     pc:`CONSTANT MaxLives = 3
 DECLARE Lives : INTEGER
 Lives ← MaxLives
 Lives ← Lives - 1`,
      after:`<div class="note tip"><b>Python</b> has no true constants. Programmers write the name in <code>UPPER_CASE</code> and never assign to it again. This site checks for exactly that.</div>
-      <div class="note"><b>Cambridge pseudocode</b>: <code>CONSTANT &lt;identifier&gt; ← &lt;value&gt;</code>. The value must be a <b>literal</b> (a number, string or Boolean typed directly), never a variable, another constant or a calculation. Some older guides write <code>CONSTANT MaxLives = 3</code>, but the 0984 syllabus uses <code>←</code>.</div>`},
+      <div class="note"><b>Cambridge pseudocode</b> uses two different symbols, so take care:<ul><li>A <b>constant</b> is declared with <b>equals</b>: <code>CONSTANT &lt;identifier&gt; = &lt;value&gt;</code>, for example <code>CONSTANT MaxLives = 3</code>.</li><li>A <b>variable</b> is given a value with the <b>arrow</b>: <code>&lt;identifier&gt; ← &lt;value&gt;</code>, for example <code>Lives ← 3</code>.</li></ul>A constant's value must be a <b>literal</b> (a number, string or Boolean typed directly), never a variable, another constant or a calculation.</div>`},
 
     {h:"Naming rules (identifiers)", html:`
       <p>An <b>identifier</b> is the name you give a variable or constant. The rules differ slightly between Cambridge pseudocode and Python:</p>
@@ -733,7 +763,7 @@ wins = 3
 xp = xp + wins * XP_PER_WIN
 print("Total XP:", xp)   # Total XP: 450`,
      pc:`// XP tracker
-CONSTANT XpPerWin ← 150
+CONSTANT XpPerWin = 150
 DECLARE Xp : INTEGER
 DECLARE Wins : INTEGER
 Xp ← 0
@@ -797,13 +827,13 @@ a = b
 b = a`,
      fields:[{label:"a", a:["8"]},{label:"b", a:["8"]}],
      why:"Line 3 copies 8 into <code>a</code>, so the 5 is <b>lost</b>. Line 4 then copies that 8 back into <code>b</code>. Both end up as <b>8</b>. To swap properly you need a third variable: <code>temp = a</code>, <code>a = b</code>, <code>b = temp</code>. (The names a and b are only used here to keep the puzzle short.)"},
-    {type:"mcq", title:"Which is correct Cambridge pseudocode?", ref:"8.1.1",
-     prompt:"A program needs a constant for the number of players in a team, 11. Which line is correct 0984 pseudocode?",
+    {type:"mcq", title:"Declaring a constant in pseudocode", ref:"8.1.1",
+     prompt:"A football team always has 11 players, so a program stores 11 in a constant called <code>TeamSize</code>. Which line declares this constant correctly in Cambridge (0984) pseudocode?",
      options:[
-       {t:"CONSTANT TeamSize ← 11", code:true, ok:true, why:"Correct: the keyword CONSTANT, a PascalCase identifier, the arrow and a literal value."},
-       {t:"CONSTANT TeamSize = 11", code:true, why:"This is the older style. The 0984 pseudocode guide uses the arrow: CONSTANT TeamSize ← 11."},
-       {t:"DECLARE TeamSize : 11", code:true, why:"DECLARE is for variables, and it needs a data type (INTEGER), not a value."},
-       {t:"CONSTANT TeamSize ← Players + 1", code:true, why:"A constant must be given a literal value, never a calculation or another variable."}
+       {t:"CONSTANT TeamSize = 11", code:true, ok:true, why:"Correct. In Cambridge pseudocode a constant is declared with <b>equals</b>: CONSTANT &lt;name&gt; = &lt;value&gt;."},
+       {t:"CONSTANT TeamSize ← 11", code:true, why:"Close, but the arrow ← is for giving a <b>variable</b> a value. A constant is declared with =, so this should be CONSTANT TeamSize = 11."},
+       {t:"DECLARE TeamSize : 11", code:true, why:"DECLARE is for variables, and it needs a data type (INTEGER), not a value. A constant uses the CONSTANT keyword."},
+       {t:"CONSTANT TeamSize = Players + 1", code:true, why:"A constant must be given a literal value (just 11), never a calculation or another variable."}
      ]},
     {type:"mcq", title:"Spot the bug", ref:"8.1.1",
      prompt:"The player should end with 2 lives, but the program prints 3. Which line causes the problem?",
@@ -849,7 +879,7 @@ players = players + 2                  # two more players join
 total_cost = players * SHIRT_PRICE     # recalculate with the new number
 print("New total cost:", total_cost, "QAR")`,
        pc:`// Kit order calculator
-CONSTANT ShirtPrice ← 45
+CONSTANT ShirtPrice = 45
 DECLARE Players : INTEGER
 DECLARE TotalCost : INTEGER
 Players ← 18
@@ -910,7 +940,7 @@ photos = 52
 free_space = STORAGE_LIMIT - apps_used - photos
 print("Free space:", free_space, "GB")`,
        pc:`// Phone storage checker
-CONSTANT StorageLimit ← 128
+CONSTANT StorageLimit = 128
 DECLARE AppsUsed : INTEGER
 DECLARE Photos : INTEGER
 DECLARE FreeSpace : INTEGER
@@ -958,7 +988,7 @@ OUTPUT "Free space: ", FreeSpace, " GB"`},
     {type:"pseudo", source:"exam-style", marks:3, ref:"8.1.1",
      prompt:`A football club's program stores the maximum squad size, <b>25</b>, which never changes. It also stores the club's name, which can change.<br>Write pseudocode to:<ul><li>declare a constant for the maximum squad size</li><li>declare a variable for the club's name with a suitable data type</li><li>assign the name <code>"Falcons FC"</code> to that variable.</li></ul>`,
      placeholder:"Write your pseudocode here, one statement per line.\nYou can type <- for the arrow.",
-     model:`CONSTANT MaxSquadSize ← 25
+     model:`CONSTANT MaxSquadSize = 25
 DECLARE ClubName : STRING
 ClubName ← "Falcons FC"`,
      mark(L,H){
@@ -968,15 +998,15 @@ ClubName ← "Falcons FC"`,
        // MP1
        if(!c){
          const dc=L.find(l=>/^DECLARE\s+.+:\s*25\s*$/i.test(l.s));
-         pts.push(H.no("Constant declared with the value 25","8.1.1", dc?"DECLARE is for variables and needs a data type. A constant is written <code>CONSTANT MaxSquadSize ← 25</code>.":"We couldn't find a line starting with the keyword <code>CONSTANT</code>."));
+         pts.push(H.no("Constant declared with the value 25","8.1.1", dc?"DECLARE is for variables and needs a data type. A constant is written <code>CONSTANT MaxSquadSize = 25</code>.":"We couldn't find a line starting with the keyword <code>CONSTANT</code>."));
        } else {
          const m=c.s.match(/^CONSTANT\s+(.+?)\s*(←|=)\s*(.+)$/i);
-         if(!m) pts.push(H.no("Constant declared with the value 25","8.1.1","Use the form <code>CONSTANT &lt;identifier&gt; ← &lt;value&gt;</code>."));
+         if(!m) pts.push(H.no("Constant declared with the value 25","8.1.1","Use the form <code>CONSTANT &lt;identifier&gt; = &lt;value&gt;</code>."));
          else{
            const idp=H.pcIdent(m[1]);
            if(m[3].trim()!=="25") pts.push(H.no("Constant declared with the value 25","8.1.1","The constant should store the literal value 25."));
            else if(idp.bad) pts.push(H.no("Constant declared with the value 25","8.1.1",`The identifier <code>${H.e(m[1])}</code> ${idp.bad}`));
-           else if(m[2]==="=") pts.push(H.no("Constant declared with the value 25","8.1.1","Nearly there. The 0984 pseudocode guide assigns a constant with the arrow: <code>CONSTANT "+H.e(m[1])+" ← 25</code>."));
+           else if(m[2]==="←") pts.push(H.no("Constant declared with the value 25","8.1.1",`Nearly there. The arrow ← is for giving a <b>variable</b> a value. A constant is declared with <b>equals</b>: <code>CONSTANT ${H.e(m[1])} = 25</code>.`));
            else pts.push(H.yes("Constant declared with the value 25","8.1.1",`<code>${H.e(c.s)}</code>${idp.style?" ("+idp.style+")":""}`));
          }
        }
@@ -1086,7 +1116,7 @@ used = float(input("Data used so far (GB): "))   # REAL: could be 12.5
 remaining = ALLOWANCE - used
 print(username, "you have", remaining, "GB left this month")`,
      pc:`// Data allowance checker
-CONSTANT Allowance ← 50
+CONSTANT Allowance = 50
 DECLARE Username : STRING
 DECLARE Used : REAL
 DECLARE Remaining : REAL
@@ -1149,8 +1179,8 @@ print(goals * 3)`,
        {t:"TypeError", code:true, why:"Python <i>can</i> multiply a string by a whole number. It repeats the text, so no error appears."},
        {t:"2 2 2", code:true, why:"The repeated text has no spaces between the copies."}
      ]},
-    {type:"mcq", title:"Correct Cambridge pseudocode", ref:"8.1.3",
-     prompt:"Which is correct 0984 pseudocode to ask for and store a username?",
+    {type:"mcq", title:"Prompting for input in pseudocode", ref:"8.1.3",
+     prompt:"In Cambridge pseudocode, <code>INPUT</code> is followed by a variable only — the on-screen prompt is written on a separate <code>OUTPUT</code> line first. Which option asks for a username and stores it correctly?",
      options:[
        {t:'INPUT "Enter username", Username', code:true, why:"INPUT is followed by a variable only. The prompt needs its own OUTPUT line."},
        {t:'OUTPUT "Enter username"\nINPUT Username', code:true, ok:true, why:"Correct: the prompt is output first, then INPUT stores the user's answer in the variable."},
@@ -1210,7 +1240,7 @@ tickets = int(input("How many tickets? "))         # whole number, so INTEGER
 total_cost = tickets * TICKET_PRICE
 print("Thanks", fan_name + ", your total is", total_cost, "QAR")`,
        pc:`// Match ticket calculator
-CONSTANT TicketPrice ← 35
+CONSTANT TicketPrice = 35
 DECLARE FanName : STRING
 DECLARE Tickets : INTEGER
 DECLARE TotalCost : INTEGER
@@ -1499,8 +1529,8 @@ DECLARE IsRaining   : BOOLEAN`,
        {t:"Line 3", why:"Raining or not is a yes/no fact → BOOLEAN is right."},
        {t:"No error", why:"Look again at the rainfall value — it can have a decimal part."}
      ]},
-    {type:"mcq", title:"How many values?", ref:"8.1.2",
-     prompt:"Which of these should be stored as a BOOLEAN?",
+    {type:"mcq", title:"Which value is a Boolean?", ref:"8.1.2",
+     prompt:"A BOOLEAN stores one of exactly two values (such as True/False or yes/no). Which of these is best stored as a BOOLEAN?",
      options:[
        {t:"The player's house team (Red, Blue, Green or Yellow)", why:"Four possible values, so not a Boolean. A Boolean has exactly two."},
        {t:"Whether the player has finished the tutorial", ok:true, why:"Correct. Finished or not — exactly two values → BOOLEAN."},
@@ -1863,7 +1893,7 @@ slices = int(input("How many slices? "))
 total = price * slices
 print("Total:", total, "QAR")`,
        pc:`// Pizza order total
-CONSTANT Price ← 3
+CONSTANT Price = 3
 OUTPUT "How many slices"
 INPUT Slices
 Total ← Price * Slices
@@ -2629,6 +2659,1601 @@ OUTPUT "Cannot ride: ", NOT (Height >= 140 AND Age >= 10)`},
   ]
 };
 
+/* ------------------------------------------------------------
+   SKILL 8 — SELECTION WITH IF (8.1.4b)
+   ------------------------------------------------------------ */
+SKILLS.s8 = {
+  n:8, title:"Selection with IF", ref:"8.1.4(b)",
+  intro:"Make a program choose. An IF statement runs a block of code only when a condition is true — the first step away from straight-line sequence.",
+  learn:[
+    {h:"A program that decides", html:`
+      <p>So far your programs have run every line in order. <b>Selection</b> lets a program <b>choose</b> whether to run a block, based on a <b>condition</b> (a True/False test — Skills 6 and 7).</p>
+      <p>In Python the block that runs only when the condition is true is <b>indented</b> under the <code>if</code>. In Cambridge pseudocode it sits between <code>THEN</code> and <code>ENDIF</code>.</p>`,
+     py:`age = int(input("Your age: "))
+if age >= 18:
+    print("You can vote")
+print("Thanks!")`,
+     pc:`INPUT Age
+IF Age >= 18 THEN
+    OUTPUT "You can vote"
+ENDIF
+OUTPUT "Thanks!"`,
+     after:`<div class="note">The "Thanks!" line is <b>not</b> indented, so it always runs. Only the indented line is controlled by the <code>if</code>. Type 20 and both lines print; type 15 and only "Thanks!" prints.</div>`},
+
+    {h:"Two choices: if / else", html:`
+      <p>Often you want one thing <b>or</b> another. <code>else</code> gives the block that runs when the condition is <b>false</b>. Exactly one of the two blocks runs — never both, never neither.</p>`,
+     py:`mark = int(input("Your mark: "))
+if mark >= 50:
+    print("Pass")
+else:
+    print("Fail")`,
+     pc:`INPUT Mark
+IF Mark >= 50 THEN
+    OUTPUT "Pass"
+ELSE
+    OUTPUT "Fail"
+ENDIF`,
+     after:`<div class="note tip">Read it as a fork in the road: the condition decides which path you take, then both paths join up again after <code>ENDIF</code>.</div>`},
+
+    {h:"More than two: if / elif / else", html:`
+      <p>For three or more choices, add <code>elif</code> (“else if”). Python checks each condition <b>in order</b> and runs the <b>first</b> one that is true, then skips the rest.</p>
+      <p>Order matters: put the most specific test first. (Cambridge pseudocode writes this as a nested IF, or a CASE statement — that's the next skill.)</p>`,
+     py:`age = int(input("Age: "))
+if age < 12:
+    print("Child")
+elif age < 65:
+    print("Adult")
+else:
+    print("Senior")`,
+     after:`<div class="note">A 70-year-old: <code>age &lt; 12</code> is false, <code>age &lt; 65</code> is false, so <code>else</code> runs → "Senior". A 30-year-old stops at <code>elif age &lt; 65</code> → "Adult" and the <code>else</code> is skipped.</div>`},
+
+    {h:"Two traps: = vs == and the boundary", html:`
+      <p><b>Trap 1 — one = or two?</b> A single <code>=</code> <i>stores</i> a value; a double <code>==</code> <i>compares</i>. A condition must compare, so it uses <code>==</code> (Python) or <code>=</code> (pseudocode). Writing <code>if score = 10:</code> in Python is a syntax error.</p>
+      <p><b>Trap 2 — the boundary.</b> "50 or more" is <code>&gt;= 50</code>, which <b>includes</b> 50. "More than 50" is <code>&gt; 50</code>, which does <b>not</b>. Getting this wrong is the single most common selection mistake in the exam.</p>`,
+     py:`# pass is 50 OR MORE, so 50 must pass
+if mark >= 50:   # correct
+    print("Pass")`,
+     after:`<div class="exam"><h3>What examiners look for</h3><p>Reports on selection questions repeatedly flag the same errors: using <code>=</code> where a comparison is needed, the wrong boundary (<code>&gt;</code> instead of <code>&gt;=</code>), and leaving the condition without a matching <code>ENDIF</code>. Always check the "equal to" case by hand.</p></div>`},
+
+    {h:"Worked example: entry price", html:`
+      <p>A museum charges by age: under 12 is free, 12–64 pays 30 QAR, 65 and over pays 15 QAR. Three outcomes → an <code>if / elif / else</code>.</p>`,
+     py:`# Museum entry price
+age = int(input("How old are you? "))
+if age < 12:
+    print("Free entry")
+elif age < 65:
+    print("Price: 30 QAR")
+else:
+    print("Price: 15 QAR")`,
+     pc:`// Museum entry price
+INPUT Age
+IF Age < 12 THEN
+    OUTPUT "Free entry"
+ELSE
+    IF Age < 65 THEN
+        OUTPUT "Price: 30 QAR"
+    ELSE
+        OUTPUT "Price: 15 QAR"
+    ENDIF
+ENDIF`,
+     after:`<p>Each person matches exactly one branch. Test the <b>boundaries</b> (11, 12, 64, 65) as well as ordinary ages — that's where selection bugs hide.</p>`}
+  ],
+
+  practise:[
+    {type:"value", title:"Predict the output", ref:"8.1.4b",
+     prompt:"The user types <b>20</b>. What is printed?",
+     lang:"py", code:`age = int(input("Age: "))
+if age >= 18:
+    print("Adult")
+else:
+    print("Child")`,
+     fields:[{label:"Output",a:["Adult"]}],
+     why:"20 >= 18 is True, so the if-block runs and the else is skipped. <b>Adult</b>."},
+    {type:"mcq", title:"Store or compare?", ref:"8.1.4b",
+     prompt:"Which line correctly tests whether <code>lives</code> is 0?",
+     options:[
+       {t:"if lives == 0:", code:true, ok:true, why:"Correct. == compares two values and gives True or False — exactly what a condition needs."},
+       {t:"if lives = 0:", code:true, why:"A single = stores a value. In a condition Python needs == to compare, so this is a syntax error."},
+       {t:"if lives := 0:", code:true, why:"That stores 0 into lives inside the condition — not a comparison, and not what you want here."},
+       {t:"if lives is 0 then:", code:true, why:"“then” is pseudocode, not Python, and this mixes styles. Python uses <code>if lives == 0:</code>."}
+     ]},
+    {type:"mcq", title:"Mind the boundary", ref:"8.1.4b",
+     prompt:"A score of <b>40 or more</b> is a pass, so <b>40 must pass</b>. Which condition is correct?",
+     options:[
+       {t:"if score >= 40:", code:true, ok:true, why:"Correct. >= includes 40, so a score of exactly 40 passes."},
+       {t:"if score > 40:", code:true, why:"> excludes 40, so a score of exactly 40 would fail. “40 or more” needs >=."},
+       {t:"if score <= 40:", code:true, why:"That is true for 40 and below — the opposite of a pass."},
+       {t:"if score = 40:", code:true, why:"A single = is a store (and a syntax error here), and it would only match exactly 40 anyway."}
+     ]},
+    {type:"value", title:"Trace the elif", ref:"8.1.4b",
+     prompt:"The user types <b>7</b>. What is printed?",
+     lang:"py", code:`n = int(input("Number: "))
+if n < 0:
+    print("Negative")
+elif n == 0:
+    print("Zero")
+else:
+    print("Positive")`,
+     fields:[{label:"Output",a:["Positive"]}],
+     why:"7 &lt; 0 is False, 7 == 0 is False, so the else runs. <b>Positive</b>."},
+    {type:"mcq", title:"Spot the error", ref:"8.1.4b / 7.8",
+     prompt:"This should print “Well done” only when the score is at least 100. Which line is wrong?",
+     lang:"py", code:`score = int(input("Score: "))
+if score > 100
+    print("Well done")`,
+     options:[
+       {t:"Line 2 — it is missing the colon", code:true, ok:true, why:"Correct. A Python <code>if</code> line must end with a colon: <code>if score &gt;= 100:</code>. (It also needs >= so that exactly 100 counts.)"},
+       {t:"Line 1 — the input is wrong", code:true, why:"Line 1 is fine: it reads a whole number into score."},
+       {t:"Line 3 — print should not be indented", code:true, why:"The indentation is correct — the print belongs to the if. The problem is on line 2."},
+       {t:"Nothing is wrong", code:true, why:"Run it: Python reports a syntax error because line 2 has no colon."}
+     ]},
+    {type:"classify", title:"Does the block run?", ref:"8.1.4b",
+     prompt:"For the code <code>if age >= 18:</code> … decide whether the indented block runs for each age.",
+     options:["Runs","Skipped"],
+     items:[
+       {t:"age = 18", code:true, a:"Runs", why:"18 >= 18 is True (>= includes the boundary), so the block runs."},
+       {t:"age = 17", code:true, a:"Skipped", why:"17 >= 18 is False, so the block is skipped."},
+       {t:"age = 65", code:true, a:"Runs", why:"65 >= 18 is True."},
+       {t:"age = 0", code:true, a:"Skipped", why:"0 >= 18 is False."}
+     ]}
+  ],
+
+  apply:[
+    {id:"a1", marks:6, title:"Pass or fail", context:"Exam",
+     brief:`<p>Write a Python program that:</p>
+      <ul><li>asks for a test <b>mark</b> (a whole number)</li>
+      <li>if the mark is <b>50 or more</b>, outputs a message containing <code>Pass</code></li>
+      <li>otherwise outputs a message containing <code>Fail</code></li>
+      <li>includes at least one comment.</li></ul>
+      <p>A mark of exactly <b>50 passes</b>, so test your boundary.</p>`,
+     example:[["out","Your mark: "],["in","50"],["out","Pass"]],
+     tests:[
+       {label:"Mark 50 (boundary)", kind:"normal", inputs:["50"], expect:"Pass"},
+       {label:"Mark 49", kind:"normal", inputs:["49"], expect:"Fail"},
+       {label:"Mark 80", kind:"extreme", inputs:["80"], expect:"Pass"}
+     ],
+     hints:[
+       "Read the mark with <code>int(input(...))</code>, then use <code>if ... else</code>.",
+       "“50 or more” is <code>mark >= 50</code> — the >= makes 50 itself pass.",
+       "Put the Pass message in the if-block and the Fail message in the else-block."
+     ],
+     model:{py:`# Pass or fail
+mark = int(input("Your mark: "))   # input
+if mark >= 50:                     # 50 or more passes
+    print("Pass")
+else:
+    print("Fail")`,
+       pc:`// Pass or fail
+INPUT Mark
+IF Mark >= 50 THEN
+    OUTPUT "Pass"
+ELSE
+    OUTPUT "Fail"
+ENDIF`},
+     mark(R){
+       const {info,H}=R, pts=[], r0=R.runs[0], r1=R.runs[1], r2=R.runs[2];
+       const ints=info.inputs.filter(i=>i.conv==="int").length;
+       pts.push(info.inputs.length>=1&&ints>=1? H.yes("The mark is input as a whole number","8.1.2 / 8.1.3","Read with int(input()).")
+         : H.no("The mark is input as a whole number","8.1.2 / 8.1.3","Ask for the mark and convert it with <code>int()</code>."));
+       pts.push((info.constructs||[]).includes("if")? H.yes("Uses selection (IF) to choose","8.1.4b","An <code>if</code> decides what to output.")
+         : H.no("Uses selection (IF) to choose","8.1.4b","Use an <code>if ... else</code> statement to choose between Pass and Fail."));
+       const passOk=!r0.error&&!r2.error&&H.outHas(r0,"pass")&&H.outHas(r2,"pass")&&!H.outHas(r0,"fail");
+       pts.push(passOk? H.yes("A mark of 50 or more passes","8.1.4b","50 and 80 both give Pass — the boundary is right.")
+         : H.no("A mark of 50 or more passes","8.1.4b", (r0.error||r2.error)?"The program stopped with an error — see above.":"Marks of 50 and 80 should both output <code>Pass</code>. Check you used <code>>= 50</code>."));
+       const failOk=!r1.error&&H.outHas(r1,"fail")&&!H.outHas(r1,"pass");
+       pts.push(failOk? H.yes("A mark below 50 fails","8.1.4b","49 gives Fail, and not Pass.")
+         : H.no("A mark below 50 fails","8.1.4b","A mark of 49 should output <code>Fail</code> (and not Pass). Put the Fail message in the <code>else</code> block."));
+       const attempted=H.attempted(pts);
+       pts.push(H.identPoint(info,{attempted, hint:"mark", roles:[
+         {name:(info.inputs[0]||{}).var||null, ok:/mark|score|grade|result/i, label:"test mark", examples:"mark"}]}));
+       pts.push(H.commentPoint(info, attempted));
+       return pts;
+     }},
+
+    {id:"a2", marks:5, title:"Cinema ticket price", context:"Entertainment",
+     brief:`<p>A cinema charges by age:</p>
+      <ul><li><b>under 12</b> → output a message containing <code>20</code> (Child)</li>
+      <li><b>12 to 64</b> → output a message containing <code>40</code> (Adult)</li>
+      <li><b>65 and over</b> → output a message containing <code>25</code> (Senior)</li></ul>
+      <p>Ask for the age (a whole number) and output the right price. Use <code>if / elif / else</code> so exactly one price is shown.</p>`,
+     example:[["out","How old are you? "],["in","8"],["out","Child: 20 QAR"]],
+     tests:[
+       {label:"Age 8 (child)", kind:"normal", inputs:["8"], expect:"20"},
+       {label:"Age 30 (adult)", kind:"normal", inputs:["30"], expect:"40"},
+       {label:"Age 70 (senior)", kind:"extreme", inputs:["70"], expect:"25"}
+     ],
+     hints:[
+       "Read the age with <code>int(input(...))</code>.",
+       "Test the youngest group first: <code>if age < 12:</code> then <code>elif age < 65:</code> then <code>else:</code>.",
+       "Each branch outputs just one price, so only one message appears per run."
+     ],
+     model:{py:`# Cinema ticket price
+age = int(input("How old are you? "))
+if age < 12:
+    print("Child: 20 QAR")
+elif age < 65:
+    print("Adult: 40 QAR")
+else:
+    print("Senior: 25 QAR")`,
+       pc:`// Cinema ticket price
+INPUT Age
+IF Age < 12 THEN
+    OUTPUT "Child: 20 QAR"
+ELSE
+    IF Age < 65 THEN
+        OUTPUT "Adult: 40 QAR"
+    ELSE
+        OUTPUT "Senior: 25 QAR"
+    ENDIF
+ENDIF`},
+     mark(R){
+       const {info,H}=R, pts=[], r0=R.runs[0], r1=R.runs[1], r2=R.runs[2];
+       const ints=info.inputs.filter(i=>i.conv==="int").length;
+       pts.push(info.inputs.length>=1&&ints>=1? H.yes("The age is input as a whole number","8.1.3","Read with int(input()).")
+         : H.no("The age is input as a whole number","8.1.3","Ask for the age and convert it with <code>int()</code>."));
+       const multi=(info.constructs||[]).includes("if")&&(info.hasElif||info.hasElse);
+       pts.push(multi? H.yes("Uses selection with more than one branch","8.1.4b","An <code>if ... elif ... else</code> chooses between the three prices.")
+         : H.no("Uses selection with more than one branch","8.1.4b","Use <code>if / elif / else</code> so the program chooses one of the three age groups."));
+       pts.push(!r0.error&&H.hasNum(r0,20)? H.yes("Correct price for a child (age 8)","8.1.4b","Under 12 → 20.")
+         : H.no("Correct price for a child (age 8)","8.1.4b", r0.error?"It stopped with an error — see above.":"Age 8 should output a price of 20."));
+       pts.push(!r1.error&&H.hasNum(r1,40)? H.yes("Correct price for an adult (age 30)","8.1.4b","12–64 → 40.")
+         : H.no("Correct price for an adult (age 30)","8.1.4b","Age 30 should output a price of 40."));
+       pts.push(!r2.error&&H.hasNum(r2,25)? H.yes("Correct price for a senior (age 70)","8.1.4b","65 and over → 25 — the final else.")
+         : H.no("Correct price for a senior (age 70)","8.1.4b","Age 70 should output a price of 25. Make sure the oldest group is the final <code>else</code>."));
+       return pts;
+     }}
+  ],
+
+  check:[
+    {type:"pseudo", source:"exam-style", marks:3, ref:"8.1.4b",
+     prompt:"A program inputs a player's <code>Score</code>. Write pseudocode that outputs <code>\"High score!\"</code> when the score is <b>1000 or more</b>, and otherwise outputs <code>\"Keep going\"</code>. Use <code>IF ... THEN ... ELSE ... ENDIF</code>.",
+     placeholder:"INPUT Score\nIF ... THEN\n    ...\nELSE\n    ...\nENDIF",
+     model:`INPUT Score
+IF Score >= 1000 THEN
+    OUTPUT "High score!"
+ELSE
+    OUTPUT "Keep going"
+ENDIF`,
+     mark(L,H){
+       const pts=[], text=L.map(l=>l.s).join("\n");
+       const ifLine=L.find(l=>/^IF\b/i.test(l.s));
+       const condOk=ifLine&&/>=\s*1000|1000\s*<=/.test(ifLine.s);
+       pts.push(condOk&&/\bTHEN\b/i.test(text)? H.yes("Correct condition with IF ... THEN","8.1.4b",`<code>${H.e(ifLine.s)}</code> — >= includes 1000.`)
+         : H.no("Correct condition with IF ... THEN","8.1.4b", ifLine&&/>\s*1000/.test(ifLine.s)?"Use <code>&gt;= 1000</code> so a score of exactly 1000 counts, and end the line with <code>THEN</code>.":"Start with <code>IF Score &gt;= 1000 THEN</code>."));
+       const hasHigh=/high score/i.test(text), hasKeep=/keep going/i.test(text), hasElse=/\bELSE\b/i.test(text);
+       pts.push(hasHigh&&hasKeep&&hasElse? H.yes("Both outputs, chosen with ELSE","8.1.4b","“High score!” in the THEN part and “Keep going” after ELSE.")
+         : H.no("Both outputs, chosen with ELSE","8.1.4b","Output <code>\"High score!\"</code> after THEN and <code>\"Keep going\"</code> after <code>ELSE</code>."));
+       pts.push(/\bENDIF\b/i.test(text)? H.yes("Closed with ENDIF","8.1.4b","The selection is closed properly.")
+         : H.no("Closed with ENDIF","8.1.4b","Close the selection with <code>ENDIF</code> on its own line. A missing ENDIF is a common exam slip."));
+       return pts;
+     }},
+    {type:"errors", source:"exam-style", marks:2, ref:"8.1.4b / 7.8",
+     prompt:"This pseudocode should output <code>\"Welcome\"</code> only when <code>Member</code> is <code>TRUE</code>. There are <b>two</b> errors. Give the line number of each and write the corrected line.",
+     code:`INPUT Member
+IF Member = TRUE
+    OUTPUT "Welcome"
+END`,
+     errors:[
+       {line:2, test:/^IF\s+Member\s*=\s*TRUE\s+THEN$/i, fix:"IF Member = TRUE THEN", trap:[{re:/==/,msg:"In pseudocode a comparison uses a single =, not ==. But the line is still missing THEN."}], why:"An IF line must end with THEN."},
+       {line:4, test:/^ENDIF$/i, fix:"ENDIF", trap:[{re:/ENDWHILE|ENDCASE|NEXT/i,msg:"An IF is closed with ENDIF, not another closer."}], why:"A selection is closed with ENDIF, not END."}
+     ]},
+    {type:"mcq", source:"exam-style", marks:1, ref:"8.1.4b",
+     prompt:"In an <code>IF ... THEN ... ELSE ... ENDIF</code> statement, how many of the two blocks run when the program is used once?",
+     options:[
+       {t:"Exactly one — the THEN block if the condition is true, otherwise the ELSE block", ok:true, why:"Correct. The condition selects one path; the two paths join again after ENDIF."},
+       {t:"Both blocks always run", why:"No — ELSE runs only when the condition is false, so the two blocks are alternatives."},
+       {t:"Neither block, unless you call it", why:"A selection isn't called like a subroutine; one branch runs as the program reaches it."},
+       {t:"It depends on the ENDIF", why:"ENDIF just marks the end of the selection; it doesn't decide how many blocks run."}
+     ]}
+  ]
+};
+
+/* ------------------------------------------------------------
+   SKILL 9 — SELECTION WITH CASE (8.1.4b)
+   ------------------------------------------------------------ */
+SKILLS.s9 = {
+  n:9, title:"Selection with CASE", ref:"8.1.4(b)",
+  intro:"When one variable can take several fixed values \u2014 a menu number, a grade, a day \u2014 CASE is the neat way to choose. In Python you write the same idea with if / elif / else.",
+  learn:[
+    {h:"One variable, many values", html:`
+      <p>When you compare the <b>same variable</b> against a list of fixed values, a chain of IFs gets long. Cambridge pseudocode has a tidier structure: <b>CASE</b>.</p>
+      <p>Python has no CASE in this course, so you write the same choice with <code>if / elif / else</code> \u2014 which you met in the last skill. Learn to read both.</p>`,
+     py:`choice = int(input("Choose 1-3: "))
+if choice == 1:
+    print("Play")
+elif choice == 2:
+    print("Settings")
+elif choice == 3:
+    print("Quit")
+else:
+    print("Invalid choice")`,
+     pc:`INPUT Choice
+CASE OF Choice
+    1 : OUTPUT "Play"
+    2 : OUTPUT "Settings"
+    3 : OUTPUT "Quit"
+    OTHERWISE OUTPUT "Invalid choice"
+ENDCASE`,
+     after:`<div class="note">Both do exactly the same job. CASE reads top to bottom and runs the branch whose value matches <code>Choice</code>. The <code>OTHERWISE</code> / <code>else</code> catches anything that doesn't match.</div>`},
+
+    {h:"The CASE structure", html:`
+      <p>A Cambridge <code>CASE</code> has four parts:</p>
+      <ul><li><code>CASE OF &lt;identifier&gt;</code> \u2014 names the variable being tested;</li>
+      <li>one line per value: <code>&lt;value&gt; : &lt;statement&gt;</code>;</li>
+      <li><code>OTHERWISE &lt;statement&gt;</code> \u2014 runs if nothing matched (optional but good practice);</li>
+      <li><code>ENDCASE</code> \u2014 closes it.</li></ul>`,
+     pc:`CASE OF Grade
+    "A" : OUTPUT "Excellent"
+    "B" : OUTPUT "Good"
+    "C" : OUTPUT "Pass"
+    OTHERWISE OUTPUT "See your teacher"
+ENDCASE`,
+     after:`<div class="note tip">The values after <code>CASE OF</code> can be numbers or characters/strings \u2014 but each branch matches an <b>exact value</b>, not a range. For \u201c40 or more\u201d use an IF; for \u201cexactly 1, 2 or 3\u201d use CASE.</div>`},
+
+    {h:"CASE or IF?", html:`
+      <p>Choose the right tool:</p>
+      <div class="tablewrap"><table class="grid">
+        <tr><th>Use CASE when\u2026</th><th>Use IF when\u2026</th></tr>
+        <tr><td>one variable is compared with several <b>exact values</b> (menu 1/2/3, grade A/B/C)</td><td>you test a <b>range</b> or a condition (<code>mark &gt;= 50</code>, <code>age &lt; 12</code>)</td></tr>
+        <tr><td>the choices are a fixed, known set</td><td>the test combines things with AND / OR</td></tr>
+      </table></div>`,
+     after:`<div class="note">A common exam instruction is \u201cuse a CASE statement\u201d. If it says that, don't write a pile of IFs \u2014 and if it's a range, CASE won't fit, so an IF is right.</div>`},
+
+    {h:"Worked example: a canteen menu", html:`
+      <p>A screen shows 1 = Pizza, 2 = Salad, 3 = Pasta. The program reads the number and prints the meal; anything else is a mistake.</p>`,
+     py:`# Canteen menu
+choice = int(input("Pick 1, 2 or 3: "))
+if choice == 1:
+    print("Pizza")
+elif choice == 2:
+    print("Salad")
+elif choice == 3:
+    print("Pasta")
+else:
+    print("Not on the menu")`,
+     pc:`// Canteen menu
+INPUT Choice
+CASE OF Choice
+    1 : OUTPUT "Pizza"
+    2 : OUTPUT "Salad"
+    3 : OUTPUT "Pasta"
+    OTHERWISE OUTPUT "Not on the menu"
+ENDCASE`,
+     after:`<div class="exam"><h3>What examiners look for</h3><p>On CASE questions, marks are lost by leaving off <code>OTHERWISE</code> (so invalid input is ignored), forgetting <code>ENDCASE</code>, or trying to put a range such as <code>&gt; 10</code> into a CASE branch. Match the structure exactly.</p></div>`}
+  ],
+
+  practise:[
+    {type:"value", title:"Trace the CASE", ref:"8.1.4b",
+     prompt:"<code>Choice</code> is <b>2</b>. What does this CASE output?<br><code>CASE OF Choice</code><br>&nbsp;&nbsp;<code>1 : OUTPUT \"Red\"</code><br>&nbsp;&nbsp;<code>2 : OUTPUT \"Green\"</code><br>&nbsp;&nbsp;<code>3 : OUTPUT \"Blue\"</code><br>&nbsp;&nbsp;<code>OTHERWISE OUTPUT \"None\"</code><br><code>ENDCASE</code>",
+     fields:[{label:"Output",a:["Green"]}],
+     why:"CASE matches the branch whose value equals Choice. Choice is 2, so it outputs <b>Green</b>."},
+    {type:"mcq", title:"CASE or IF?", ref:"8.1.4b",
+     prompt:"Which job is best done with a <b>CASE</b> statement?",
+     options:[
+       {t:"Printing a day name from a day number 1\u20137", ok:true, why:"Correct. One variable compared with several exact values \u2014 exactly what CASE is for."},
+       {t:"Checking whether a mark is 50 or more", why:"That's a range (>= 50), so it needs an IF. CASE matches exact values, not ranges."},
+       {t:"Checking a password is correct AND the user is an admin", why:"That combines conditions with AND \u2014 an IF, not a CASE."},
+       {t:"Repeating a message 10 times", why:"That's repetition (a loop), not selection."}
+     ]},
+    {type:"mcq", title:"Correct CASE syntax", ref:"8.1.4b",
+     prompt:"Which is a correctly written Cambridge CASE header and closer?",
+     options:[
+       {t:"CASE OF Grade ... ENDCASE", code:true, ok:true, why:"Correct. CASE OF names the variable; ENDCASE closes the statement."},
+       {t:"CASE Grade ... END", code:true, why:"Two slips: it's missing OF after CASE, and a CASE is closed with ENDCASE, not END."},
+       {t:"SELECT Grade ... ENDSELECT", code:true, why:"SELECT isn't a Cambridge pseudocode keyword. Use CASE OF ... ENDCASE."},
+       {t:"CASE OF Grade ... ENDIF", code:true, why:"The header is right, but a CASE is closed with ENDCASE, not ENDIF."}
+     ]},
+    {type:"value", title:"Trace the if / elif", ref:"8.1.4b",
+     prompt:"The user types <b>3</b>. What is printed?",
+     lang:"py", code:`n = int(input("Pick: "))
+if n == 1:
+    print("One")
+elif n == 2:
+    print("Two")
+else:
+    print("Other")`,
+     fields:[{label:"Output",a:["Other"]}],
+     why:"3 isn't 1 or 2, so the else runs. <b>Other</b>. (Python's if/elif/else is the CASE of this course.)"},
+    {type:"mcq", title:"What does OTHERWISE do?", ref:"8.1.4b",
+     prompt:"In a CASE statement, when does the <code>OTHERWISE</code> branch run?",
+     options:[
+       {t:"When the variable's value matches none of the listed values", ok:true, why:"Correct. OTHERWISE is the catch-all, like else \u2014 it handles anything not listed."},
+       {t:"Always, at the end", why:"No \u2014 OTHERWISE runs only when nothing above it matched."},
+       {t:"When the variable equals 0", why:"It isn't tied to any particular value; it's whatever is left over."},
+       {t:"Never \u2014 it is just a comment", why:"OTHERWISE is a real branch that runs for unmatched values."}
+     ]},
+    {type:"classify", title:"CASE-friendly or not?", ref:"8.1.4b",
+     prompt:"Decide whether each test fits a CASE (exact values) or needs an IF (a range or combined condition).",
+     options:["CASE (exact values)","IF (range / condition)"],
+     items:[
+       {t:"menu is 1, 2 or 3", a:"CASE (exact values)", why:"Exact values of one variable \u2192 CASE."},
+       {t:"temperature is above 30", a:"IF (range / condition)", why:"\u201cabove 30\u201d is a range \u2192 IF."},
+       {t:"grade is 'A', 'B' or 'C'", a:"CASE (exact values)", why:"Exact character values \u2192 CASE."},
+       {t:"age is under 12 or over 65", a:"IF (range / condition)", why:"Ranges combined with OR \u2192 IF."}
+     ]}
+  ],
+
+  apply:[
+    {id:"a1", marks:6, title:"Game menu", context:"Gaming",
+     brief:`<p>A game shows a menu: <b>1</b> = Play, <b>2</b> = Settings, <b>3</b> = Quit. Write a Python program that:</p>
+      <ul><li>asks for the choice (a whole number)</li>
+      <li>outputs a message containing <code>Play</code>, <code>Settings</code> or <code>Quit</code> to match</li>
+      <li>for any other number, outputs a message containing <code>Invalid</code>.</li></ul>
+      <p>Use <code>if / elif / else</code> so exactly one message appears.</p>`,
+     example:[["out","Choose 1-3: "],["in","1"],["out","Play"]],
+     tests:[
+       {label:"Choice 1", kind:"normal", inputs:["1"], expect:"Play"},
+       {label:"Choice 2", kind:"normal", inputs:["2"], expect:"Settings"},
+       {label:"Choice 3", kind:"normal", inputs:["3"], expect:"Quit"},
+       {label:"Choice 9 (invalid)", kind:"abnormal", inputs:["9"], expect:"Invalid"}
+     ],
+     hints:[
+       "Read the choice with <code>int(input(...))</code>.",
+       "One branch per value: <code>if choice == 1:</code>, <code>elif choice == 2:</code>, <code>elif choice == 3:</code>, then <code>else:</code>.",
+       "The <code>else</code> is your OTHERWISE \u2014 it catches every number that isn't 1, 2 or 3."
+     ],
+     model:{py:`# Game menu
+choice = int(input("Choose 1-3: "))
+if choice == 1:
+    print("Play")
+elif choice == 2:
+    print("Settings")
+elif choice == 3:
+    print("Quit")
+else:
+    print("Invalid choice")`,
+       pc:`// Game menu
+INPUT Choice
+CASE OF Choice
+    1 : OUTPUT "Play"
+    2 : OUTPUT "Settings"
+    3 : OUTPUT "Quit"
+    OTHERWISE OUTPUT "Invalid choice"
+ENDCASE`},
+     mark(R){
+       const {info,H}=R, pts=[], [r0,r1,r2,r3]=R.runs;
+       const ints=info.inputs.filter(i=>i.conv==="int").length;
+       pts.push(info.inputs.length>=1&&ints>=1? H.yes("The choice is input as a whole number","8.1.3","Read with int(input()).")
+         : H.no("The choice is input as a whole number","8.1.3","Ask for the choice and convert it with <code>int()</code>."));
+       const multi=(info.constructs||[]).includes("if")&&(info.hasElif||info.hasElse);
+       pts.push(multi? H.yes("Uses selection with several branches","8.1.4b","An <code>if ... elif ... else</code> chooses the menu option.")
+         : H.no("Uses selection with several branches","8.1.4b","Use <code>if / elif / else</code> so each menu number has its own branch."));
+       pts.push(!r0.error&&H.outHas(r0,"play")? H.yes("Choice 1 gives Play","8.1.4b","1 \u2192 Play.")
+         : H.no("Choice 1 gives Play","8.1.4b", r0.error?"It stopped with an error \u2014 see above.":"Choice 1 should output a message containing <code>Play</code>."));
+       pts.push(!r1.error&&H.outHas(r1,"settings")? H.yes("Choice 2 gives Settings","8.1.4b","2 \u2192 Settings.")
+         : H.no("Choice 2 gives Settings","8.1.4b","Choice 2 should output a message containing <code>Settings</code>."));
+       pts.push(!r2.error&&H.outHas(r2,"quit")? H.yes("Choice 3 gives Quit","8.1.4b","3 \u2192 Quit.")
+         : H.no("Choice 3 gives Quit","8.1.4b","Choice 3 should output a message containing <code>Quit</code>."));
+       pts.push(!r3.error&&H.outHas(r3,"invalid")&&!H.outHas(r3,"play")? H.yes("Other numbers are handled (OTHERWISE)","8.1.4b","9 \u2192 Invalid, via the else.")
+         : H.no("Other numbers are handled (OTHERWISE)","8.1.4b","A number that isn't 1\u20133 (e.g. 9) should output <code>Invalid</code>. Put that in the final <code>else</code>."));
+       return pts;
+     }},
+
+    {id:"a2", marks:5, title:"Grade feedback", context:"Exam",
+     brief:`<p>Write a Python program that reads a <b>grade letter</b> and gives feedback:</p>
+      <ul><li><code>A</code> \u2192 a message containing <code>Excellent</code></li>
+      <li><code>B</code> \u2192 a message containing <code>Good</code></li>
+      <li><code>C</code> \u2192 a message containing <code>Pass</code></li>
+      <li>any other letter \u2192 a message containing <code>See your teacher</code>.</li></ul>
+      <p>The grade is a letter, so it stays as text \u2014 no <code>int()</code> needed. The tests enter capital letters.</p>`,
+     example:[["out","Your grade: "],["in","A"],["out","Excellent"]],
+     tests:[
+       {label:"Grade A", kind:"normal", inputs:["A"], expect:"Excellent"},
+       {label:"Grade B", kind:"normal", inputs:["B"], expect:"Good"},
+       {label:"Grade C", kind:"normal", inputs:["C"], expect:"Pass"},
+       {label:"Grade Z (other)", kind:"abnormal", inputs:["Z"], expect:"See your teacher"}
+     ],
+     hints:[
+       "Read the grade with <code>grade = input(...)</code> \u2014 no int(), it's a letter.",
+       "Compare text with quotation marks: <code>if grade == \"A\":</code>.",
+       "The final <code>else</code> handles any letter that isn't A, B or C."
+     ],
+     model:{py:`# Grade feedback
+grade = input("Your grade: ")
+if grade == "A":
+    print("Excellent")
+elif grade == "B":
+    print("Good")
+elif grade == "C":
+    print("Pass")
+else:
+    print("See your teacher")`,
+       pc:`// Grade feedback
+INPUT Grade
+CASE OF Grade
+    "A" : OUTPUT "Excellent"
+    "B" : OUTPUT "Good"
+    "C" : OUTPUT "Pass"
+    OTHERWISE OUTPUT "See your teacher"
+ENDCASE`},
+     mark(R){
+       const {info,H}=R, pts=[], [r0,r1,r2,r3]=R.runs;
+       pts.push(info.inputs.length>=1? H.yes("Reads a grade letter","8.1.3","An input reads the grade.")
+         : H.no("Reads a grade letter","8.1.3","Read the grade with <code>input(...)</code>."));
+       pts.push(!r0.error&&H.outHas(r0,"excellent")? H.yes("Grade A \u2192 Excellent","8.1.4b","A \u2192 Excellent.")
+         : H.no("Grade A \u2192 Excellent","8.1.4b", r0.error?"It stopped with an error \u2014 see above.":"Grade A should output <code>Excellent</code>. Compare with <code>grade == \"A\"</code>."));
+       pts.push(!r1.error&&H.outHas(r1,"good")? H.yes("Grade B \u2192 Good","8.1.4b","B \u2192 Good.")
+         : H.no("Grade B \u2192 Good","8.1.4b","Grade B should output <code>Good</code>."));
+       pts.push(!r2.error&&H.outHas(r2,"pass")? H.yes("Grade C \u2192 Pass","8.1.4b","C \u2192 Pass.")
+         : H.no("Grade C \u2192 Pass","8.1.4b","Grade C should output <code>Pass</code>."));
+       pts.push(!r3.error&&H.outHas(r3,"see your teacher")&&!H.outHas(r3,"excellent")? H.yes("Any other grade is caught (OTHERWISE)","8.1.4b","Z \u2192 See your teacher, via the else.")
+         : H.no("Any other grade is caught (OTHERWISE)","8.1.4b","A letter that isn't A, B or C should output <code>See your teacher</code>. Put it in the final <code>else</code>."));
+       return pts;
+     }}
+  ],
+
+  check:[
+    {type:"pseudo", source:"exam-style", marks:3, ref:"8.1.4b",
+     prompt:"A variable <code>Day</code> holds a day number. Write a <b>CASE</b> statement that outputs <code>\"Weekday\"</code> for 1, 2, 3, 4 or 5 and <code>\"Weekend\"</code> for 6 or 7. Use <code>CASE OF ... OTHERWISE ... ENDCASE</code>.",
+     placeholder:"CASE OF Day\n    1 : OUTPUT ...\n    ...\n    OTHERWISE ...\nENDCASE",
+     model:`CASE OF Day
+    1 : OUTPUT "Weekday"
+    2 : OUTPUT "Weekday"
+    3 : OUTPUT "Weekday"
+    4 : OUTPUT "Weekday"
+    5 : OUTPUT "Weekday"
+    OTHERWISE OUTPUT "Weekend"
+ENDCASE`,
+     mark(L,H){
+       const pts=[], text=L.map(l=>l.s).join("\n");
+       pts.push(/CASE\s+OF\s+Day/i.test(text)&&/ENDCASE/i.test(text)? H.yes("CASE OF Day ... ENDCASE","8.1.4b","The CASE is opened on the right variable and closed with ENDCASE.")
+         : H.no("CASE OF Day ... ENDCASE","8.1.4b", /CASE\s+Day/i.test(text)?"It's missing <code>OF</code>: write <code>CASE OF Day</code>, closed with <code>ENDCASE</code>.":"Start with <code>CASE OF Day</code> and close with <code>ENDCASE</code>."));
+       const weekdayVals=["1","2","3","4","5"].every(v=>new RegExp("(^|\\n)\\s*"+v+"\\s*:","").test(text))&&/weekday/i.test(text);
+       pts.push(weekdayVals? H.yes("Days 1\u20135 give Weekday","8.1.4b","Each of 1\u20135 has a branch that outputs Weekday.")
+         : H.no("Days 1\u20135 give Weekday","8.1.4b","Give each day 1, 2, 3, 4 and 5 a branch (<code>1 : OUTPUT \"Weekday\"</code>, and so on)."));
+       pts.push(/OTHERWISE/i.test(text)&&/weekend/i.test(text)? H.yes("OTHERWISE gives Weekend","8.1.4b","6 and 7 fall through to OTHERWISE \u2192 Weekend.")
+         : H.no("OTHERWISE gives Weekend","8.1.4b","Use <code>OTHERWISE OUTPUT \"Weekend\"</code> to cover 6 and 7."));
+       return pts;
+     }},
+    {type:"errors", source:"exam-style", marks:2, ref:"8.1.4b / 7.8",
+     prompt:"This CASE statement has <b>two</b> errors. Give the line number of each and write the corrected line.",
+     code:`CASE Grade
+    "A" : OUTPUT "Gold"
+    "B" : OUTPUT "Silver"
+    OTHERWISE OUTPUT "No medal"
+END`,
+     errors:[
+       {line:1, test:/^CASE\s+OF\s+Grade$/i, fix:"CASE OF Grade", trap:[{re:/^SELECT/i,msg:"The keyword is CASE OF, not SELECT."}], why:"A CASE header is written CASE OF <identifier>."},
+       {line:5, test:/^ENDCASE$/i, fix:"ENDCASE", trap:[{re:/ENDIF|ENDWHILE/i,msg:"A CASE is closed with ENDCASE, not ENDIF/ENDWHILE."}], why:"A CASE is closed with ENDCASE."}
+     ]},
+    {type:"mcq", source:"exam-style", marks:1, ref:"8.1.4b",
+     prompt:"You must choose an action from a menu where the input is one of the fixed values 1, 2, 3 or 4. Which construct is the most suitable?",
+     options:[
+       {t:"A CASE statement", ok:true, why:"Correct. CASE is designed for choosing between several exact values of one variable."},
+       {t:"A WHILE loop", why:"A loop repeats; it doesn't choose between fixed options."},
+       {t:"A single IF with no ELSE", why:"That handles only one value; you need all four, so CASE (or if/elif/else) fits better."},
+       {t:"A FOR loop", why:"A FOR loop counts a fixed number of times \u2014 it isn't selection."}
+     ]}
+  ]
+};
+
+/* ------------------------------------------------------------
+   SKILL 10 — COUNT-CONTROLLED LOOPS (FOR) (8.1.4c)
+   ------------------------------------------------------------ */
+SKILLS.s10 = {
+  n:10, title:"Count-controlled loops (FOR)", ref:"8.1.4(c)",
+  intro:"When you know how many times to repeat, use a FOR loop. It counts for you — no copy‑paste, no off‑by‑one slips.",
+  learn:[
+    {h:"Repeating a fixed number of times", html:`
+      <p><b>Iteration</b> means repeating. A <b>count-controlled</b> loop repeats a <b>known</b> number of times, using a counter that goes up by one each pass.</p>
+      <p>Cambridge pseudocode: <code>FOR Count ← 1 TO 5 ... NEXT Count</code>. Python: <code>for count in range(...)</code>.</p>`,
+     py:`for count in range(1, 6):
+    print("Hello", count)`,
+     pc:`FOR Count ← 1 TO 5
+    OUTPUT "Hello ", Count
+NEXT Count`,
+     after:`<div class="note">Both print five lines, with Count going 1, 2, 3, 4, 5. The indented line is the <b>loop body</b> — it runs once per pass.</div>`},
+
+    {h:"range(): mind the ends", html:`
+      <p>Python's <code>range</code> is where loops trip people up:</p>
+      <ul><li><code>range(5)</code> → <b>0, 1, 2, 3, 4</b> (starts at 0, <b>stops before</b> 5) — five numbers.</li>
+      <li><code>range(1, 6)</code> → <b>1, 2, 3, 4, 5</b> (starts at 1, stops before 6).</li>
+      <li><code>range(2, 11, 2)</code> → <b>2, 4, 6, 8, 10</b> (step of 2).</li></ul>
+      <p>The <b>stop value is never reached</b>. To count 1 to 10 you write <code>range(1, 11)</code>.</p>`,
+     py:`print(list(range(1, 6)))   # [1, 2, 3, 4, 5]`,
+     after:`<div class="note tip">Pseudocode <code>FOR Count ← 1 TO 5</code> <b>includes</b> 5 — it runs for 1, 2, 3, 4, 5. Python's <code>range(1, 6)</code> gives the same list, which is why the second number is one bigger.</div>`},
+
+    {h:"Using the counter", html:`
+      <p>The counter isn't just for show — you can use its value in the body. A common pattern is a <b>running total</b>: start at 0, then add something each pass.</p>`,
+     py:`total = 0
+for n in range(1, 6):
+    total = total + n      # add 1, then 2, ... up to 5
+print("Total:", total)     # Total: 15`,
+     pc:`Total ← 0
+FOR N ← 1 TO 5
+    Total ← Total + N
+NEXT N
+OUTPUT "Total: ", Total`,
+     after:`<div class="note">Set the total <b>before</b> the loop, add inside it, and output <b>after</b> it. Putting the output inside the loop would print five times instead of once.</div>`},
+
+    {h:"Worked example: a times table", html:`
+      <p>Show the 7 times table up to 7 × 5. The loop runs five times, and each pass uses the counter to work out the next line.</p>`,
+     py:`# 7 times table
+number = 7
+for i in range(1, 6):
+    print(number * i)      # 7, 14, 21, 28, 35`,
+     pc:`// 7 times table
+Number ← 7
+FOR I ← 1 TO 5
+    OUTPUT Number * I
+NEXT I`,
+     after:`<div class="exam"><h3>What examiners look for</h3><p>Count-controlled loop errors are nearly always the <b>number of repeats</b>: an off-by-one so the loop runs one too many or too few times. Count the passes by hand. In pseudocode, remember <code>FOR</code> uses the assignment arrow (<code>←</code>) and ends with <code>NEXT</code>.</p></div>`}
+  ],
+
+  practise:[
+    {type:"value", title:"Predict the output", ref:"8.1.4c",
+     prompt:"How many lines does this print, and what is on the last line?",
+     lang:"py", code:`for i in range(1, 4):
+    print("Line", i)`,
+     fields:[{label:"Number of lines",a:["3"]},{label:"Last line printed",a:["Line 3"]}],
+     why:"range(1, 4) gives 1, 2, 3 — three passes. The last prints <b>Line 3</b> (4 is never reached)."},
+    {type:"mcq", title:"How many numbers?", ref:"8.1.4c",
+     prompt:"Which numbers does <code>range(1, 6)</code> produce?",
+     options:[
+       {t:"1, 2, 3, 4, 5", code:true, ok:true, why:"Correct. range starts at 1 and stops before 6, so it never reaches 6."},
+       {t:"1, 2, 3, 4, 5, 6", code:true, why:"The stop value (6) is never included. This is the classic off-by-one error."},
+       {t:"0, 1, 2, 3, 4, 5", code:true, why:"When you give a start value (1), counting begins there, not at 0."},
+       {t:"6 numbers", code:true, why:"It's five numbers: 1 to 5. The 6 is the stop value and is excluded."}
+     ]},
+    {type:"value", title:"Trace a running total", ref:"8.1.4c",
+     prompt:"What does this print?",
+     lang:"py", code:`total = 0
+for n in range(1, 4):
+    total = total + n
+print(total)`,
+     fields:[{label:"Output",a:["6"]}],
+     why:"total goes 0, then +1 = 1, then +2 = 3, then +3 = 6. The loop runs for 1, 2, 3. <b>6</b>."},
+    {type:"mcq", title:"Correct FOR in pseudocode", ref:"8.1.4c",
+     prompt:"Which is a correctly written Cambridge count-controlled loop that runs 10 times?",
+     options:[
+       {t:"FOR Count ← 1 TO 10 ... NEXT Count", code:true, ok:true, why:"Correct. FOR uses the arrow ←, counts 1 to 10 inclusive, and ends with NEXT."},
+       {t:"FOR Count = 1 TO 10 ... NEXT Count", code:true, why:"A FOR loop sets its counter with the arrow ←, not =."},
+       {t:"FOR Count ← 1 TO 10 ... ENDFOR", code:true, why:"A Cambridge FOR loop ends with NEXT (and the counter name), not ENDFOR."},
+       {t:"LOOP Count ← 1 TO 10 ... NEXT Count", code:true, why:"The keyword is FOR, not LOOP."}
+     ]},
+    {type:"mcq", title:"How many passes?", ref:"8.1.4c",
+     prompt:"How many times does the body of <code>FOR Count ← 1 TO 5</code> run?",
+     options:[
+       {t:"5 times", ok:true, why:"Correct. The pseudocode TO value is inclusive, so Count is 1, 2, 3, 4, 5 — five passes."},
+       {t:"4 times", why:"TO 5 includes 5, so it runs five times, not four."},
+       {t:"6 times", why:"It starts at 1, not 0, so it's five passes (1–5)."},
+       {t:"Once", why:"A loop repeats — here it repeats five times."}
+     ]},
+    {type:"classify", title:"How many iterations?", ref:"8.1.4c",
+     prompt:"For each range, decide how many times the loop runs.",
+     options:["3 times","5 times"],
+     items:[
+       {t:"range(3)", code:true, a:"3 times", why:"range(3) is 0, 1, 2 — three passes."},
+       {t:"range(1, 6)", code:true, a:"5 times", why:"1, 2, 3, 4, 5 — five passes."},
+       {t:"range(5)", code:true, a:"5 times", why:"0, 1, 2, 3, 4 — five passes."},
+       {t:"range(2, 5)", code:true, a:"3 times", why:"2, 3, 4 — three passes."}
+     ]}
+  ],
+
+  apply:[
+    {id:"a1", marks:6, title:"Add up the scores", context:"Sport",
+     brief:`<p>Write a Python program that:</p>
+      <ul><li>asks <b>how many</b> scores there are (a whole number)</li>
+      <li>uses a <b>loop</b> to read that many scores, one at a time</li>
+      <li>adds them up and outputs the <b>total</b></li>
+      <li>uses clear names and at least one comment.</li></ul>
+      <p>Build the total with a running total: start at 0 and add each score inside the loop.</p>`,
+     example:[["out","How many scores? "],["in","3"],["out","Score: "],["in","10"],["out","Score: "],["in","20"],["out","Score: "],["in","30"],["out","Total: 60"]],
+     tests:[
+       {label:"Three scores", kind:"normal", inputs:["3","10","20","30"], expect:"Total 60"},
+       {label:"One score", kind:"normal", inputs:["1","5"], expect:"Total 5"},
+       {label:"Two zeros", kind:"extreme", inputs:["2","0","0"], expect:"Total 0"}
+     ],
+     hints:[
+       "Read the count with <code>int(input(...))</code>, then <code>for i in range(count):</code>.",
+       "Make a <code>total = 0</code> before the loop, and <code>total = total + score</code> inside it.",
+       "Read and convert each score with <code>int(input(...))</code> inside the loop."
+     ],
+     model:{py:`# Add up the scores
+count = int(input("How many scores? "))   # how many to read
+total = 0
+for i in range(count):
+    score = int(input("Score: "))
+    total = total + score
+print("Total:", total)`,
+       pc:`// Add up the scores
+INPUT Count
+Total ← 0
+FOR I ← 1 TO Count
+    INPUT Score
+    Total ← Total + Score
+NEXT I
+OUTPUT "Total: ", Total`},
+     mark(R){
+       const {info,H}=R, pts=[], [r0,r1,r2]=R.runs;
+       const ints=info.inputs.filter(i=>i.conv==="int").length;
+       pts.push(info.inputs.length>=1&&ints>=1? H.yes("Reads whole numbers with int()","8.1.3","The count and scores are read as whole numbers.")
+         : H.no("Reads whole numbers with int()","8.1.3","Read the count and each score with <code>int(input(...))</code>."));
+       pts.push((info.constructs||[]).includes("for")||(info.constructs||[]).includes("while")? H.yes("Uses a loop to repeat","8.1.4c","A loop reads the scores instead of copy‑pasting input lines.")
+         : H.no("Uses a loop to repeat","8.1.4c","Use a <code>for</code> loop that repeats <code>count</code> times."));
+       pts.push(!r0.error&&H.hasNum(r0,60)? H.yes("Correct total for three scores","8.1.4c","10 + 20 + 30 = 60.")
+         : H.no("Correct total for three scores","8.1.4c", r0.error?"The program stopped with an error — does the loop read exactly the right number of scores?":"We expected a total of 60. Build it with a running total inside the loop."));
+       pts.push(!r1.error&&H.hasNum(r1,5)? H.yes("Works for one score too","8.1.4c","A single score of 5 gives 5 — the loop count really follows the input.")
+         : H.no("Works for one score too","8.1.4c","With one score of 5 the total should be 5. The loop must repeat exactly <code>count</code> times."));
+       const attempted=H.attempted(pts);
+       const totalVar=(info.assigns.find(a=>/total|sum/i.test(a.name))||{}).name||null;
+       pts.push(H.identPoint(info,{attempted, hint:"count, total", roles:[
+         {name:totalVar, ok:/total|sum/i, label:"running total", examples:"total"}]}));
+       pts.push(H.commentPoint(info, attempted));
+       return pts;
+     }},
+
+    {id:"a2", marks:5, title:"Print a times table", context:"Maths",
+     brief:`<p>Write a Python program that asks for a <b>number</b> (a whole number) and then uses a <b>FOR loop</b> to print its times table from <b>×1 to ×5</b> — five lines.</p>
+      <p>For 3 it prints 3, 6, 9, 12, 15. For 10 it prints 10, 20, 30, 40, 50.</p>`,
+     example:[["out","Which table? "],["in","3"],["out","3\n"],["out","6\n"],["out","9\n"],["out","12\n"],["out","15"]],
+     tests:[
+       {label:"3 times table", kind:"normal", inputs:["3"], expect:"3,6,9,12,15"},
+       {label:"10 times table", kind:"normal", inputs:["10"], expect:"10,20,30,40,50"}
+     ],
+     hints:[
+       "Read the number with <code>int(input(...))</code>.",
+       "Loop five times with <code>for i in range(1, 6):</code> — i goes 1 to 5.",
+       "Each pass, print <code>number * i</code>."
+     ],
+     model:{py:`# Times table
+number = int(input("Which table? "))
+for i in range(1, 6):
+    print(number * i)`,
+       pc:`// Times table
+INPUT Number
+FOR I ← 1 TO 5
+    OUTPUT Number * I
+NEXT I`},
+     mark(R){
+       const {info,H}=R, pts=[], [r0,r1]=R.runs;
+       const ints=info.inputs.filter(i=>i.conv==="int").length;
+       pts.push(info.inputs.length>=1&&ints>=1? H.yes("The number is input as a whole number","8.1.3","Read with int(input()).")
+         : H.no("The number is input as a whole number","8.1.3","Ask for the number and convert it with <code>int()</code>."));
+       pts.push((info.constructs||[]).includes("for")? H.yes("Uses a FOR loop","8.1.4c","A count-controlled loop builds the table.")
+         : H.no("Uses a FOR loop","8.1.4c","Use <code>for i in range(1, 6):</code> to repeat five times."));
+       pts.push(!r0.error&&H.numsInOrder(r0,[3,6,9,12,15])? H.yes("Correct table for 3","8.1.4c","3, 6, 9, 12, 15.")
+         : H.no("Correct table for 3","8.1.4c", r0.error?"It stopped with an error — see above.":"For 3 the output should be 3, 6, 9, 12, 15. Print <code>number * i</code> each pass."));
+       pts.push(!r1.error&&H.numsInOrder(r1,[10,20,30,40,50])? H.yes("Correct table for 10","8.1.4c","10, 20, 30, 40, 50 — the table follows the input.")
+         : H.no("Correct table for 10","8.1.4c","For 10 the output should be 10, 20, 30, 40, 50."));
+       const five=!r0.error&&!r1.error&&H.nums(r0).length===5&&H.nums(r1).length===5;
+       pts.push(five? H.yes("Prints exactly five rows","8.1.4c","The loop runs 1 to 5 — no more, no fewer.")
+         : H.no("Prints exactly five rows","8.1.4c","Print exactly five lines (×1 to ×5). Check your <code>range</code> doesn't run too many or too few times."));
+       return pts;
+     }}
+  ],
+
+  check:[
+    {type:"trace", source:"exam-style", marks:3, ref:"8.1.4c / 7.7",
+     prompt:"Complete the trace table for this algorithm.",
+     code:`Total ← 0
+FOR Count ← 1 TO 3
+    Total ← Total + Count
+NEXT Count
+OUTPUT Total`,
+     cols:["Count","Total","OUTPUT"],
+     rows:[["","0",""],["1","1",""],["2","3",""],["3","6",""],["","","6"]],
+     given:[[0,1]],
+     markCols:[{col:0,label:"Count column: 1, 2, 3"},{col:1,label:"Total column: 0, 1, 3, 6"},{col:2,label:"OUTPUT column: 6"}]},
+    {type:"pseudo", source:"exam-style", marks:3, ref:"8.1.4c",
+     prompt:"Write pseudocode that uses a <b>FOR loop</b> to output the numbers <b>1 to 5</b>, each on its own line.",
+     placeholder:"FOR Count ← 1 TO 5\n    OUTPUT ...\nNEXT Count",
+     model:`FOR Count ← 1 TO 5
+    OUTPUT Count
+NEXT Count`,
+     mark(L,H){
+       const pts=[], text=L.map(l=>l.s).join("\n");
+       const forLine=L.find(l=>/^FOR\b/i.test(l.s));
+       const headOk=forLine&&/FOR\s+\w+\s*←\s*1\s+TO\s+5/i.test(forLine.s);
+       pts.push(headOk? H.yes("FOR counts 1 TO 5 with the arrow","8.1.4c",`<code>${H.e(forLine.s)}</code>`)
+         : H.no("FOR counts 1 TO 5 with the arrow","8.1.4c", forLine&&/=/.test(forLine.s)?"A FOR loop sets its counter with the arrow: <code>FOR Count ← 1 TO 5</code>.":"Start with <code>FOR Count ← 1 TO 5</code>."));
+       pts.push(/OUTPUT\b/i.test(text)? H.yes("Outputs the counter in the body","8.1.4c","The loop body outputs the count.")
+         : H.no("Outputs the counter in the body","8.1.4c","Inside the loop, <code>OUTPUT</code> the counter."));
+       pts.push(/\bNEXT\b/i.test(text)? H.yes("Closed with NEXT","8.1.4c","The loop is closed with NEXT.")
+         : H.no("Closed with NEXT","8.1.4c","A Cambridge FOR loop ends with <code>NEXT</code> (and the counter name), not ENDFOR."));
+       return pts;
+     }},
+    {type:"mcq", source:"exam-style", marks:1, ref:"8.1.4c",
+     prompt:"Which situation is best solved with a <b>count-controlled</b> (FOR) loop?",
+     options:[
+       {t:"Printing each of a team's 11 player numbers", ok:true, why:"Correct. You know it repeats exactly 11 times — a known count → FOR."},
+       {t:"Asking for a password until it is correct", why:"You don't know how many tries it takes, so that's a condition-controlled loop (WHILE/REPEAT), not FOR."},
+       {t:"Choosing a message based on a grade", why:"That's selection (IF/CASE), not repetition."},
+       {t:"Stopping when the user types 'quit'", why:"The number of repeats isn't known in advance → a condition-controlled loop, not FOR."}
+     ]}
+  ]
+};
+
+/* ------------------------------------------------------------
+   SKILL 11 — PRE-CONDITION LOOPS (WHILE) (8.1.4c)
+   ------------------------------------------------------------ */
+SKILLS.s11 = {
+  n:11, title:"Pre-condition loops (WHILE)", ref:"8.1.4(c)",
+  intro:"When you don't know how many times to repeat — keep asking until the answer is valid, keep going until a total is reached — use a WHILE loop. It checks a condition before each pass.",
+  learn:[
+    {h:"Looping while a condition is true", html:`
+      <p>A <b>pre-condition</b> (WHILE) loop checks a condition <b>before</b> each pass. While the condition is true it runs the body; as soon as it is false it stops. Because it tests first, the body may run <b>zero</b> times.</p>`,
+     py:`count = 1
+while count <= 3:
+    print(count)
+    count = count + 1`,
+     pc:`Count ← 1
+WHILE Count <= 3 DO
+    OUTPUT Count
+    Count ← Count + 1
+ENDWHILE`,
+     after:`<div class="note">If <code>count</code> had started at 5, the condition <code>count &lt;= 3</code> would be false straight away and the body would never run. That's the point of a pre-condition loop.</div>`},
+
+    {h:"Three things every WHILE needs", html:`
+      <p>To stop, a WHILE loop needs all three:</p>
+      <ul><li><b>Initialise</b> the condition variable <i>before</i> the loop;</li>
+      <li><b>test</b> it at the top;</li>
+      <li><b>change</b> it <i>inside</i> the loop so the condition can eventually become false.</li></ul>
+      <p>Miss the change and the loop runs forever — an <b>infinite loop</b>.</p>`,
+     py:`# INFINITE LOOP - count never changes!
+count = 1
+while count <= 3:
+    print(count)   # prints 1 forever`,
+     after:`<div class="note tip">If a program seems to hang or print the same thing endlessly, check that something inside the loop changes the value the condition depends on.</div>`},
+
+    {h:"The classic use: keep asking until valid", html:`
+      <p>You often don't know how many tries a user will take — perfect for WHILE. Read a value, then <b>while it's wrong, ask again</b>.</p>`,
+     py:`age = int(input("Age (1-120): "))
+while age < 1 or age > 120:
+    print("Out of range, try again")
+    age = int(input("Age (1-120): "))
+print("Thanks!")`,
+     pc:`INPUT Age
+WHILE Age < 1 OR Age > 120 DO
+    OUTPUT "Out of range, try again"
+    INPUT Age
+ENDWHILE
+OUTPUT "Thanks!"`,
+     after:`<div class="note">Read once <b>before</b> the loop so there's something to test; read again <b>inside</b> it so a wrong answer gets another go. A valid first answer skips the loop entirely.</div>`},
+
+    {h:"Worked example: reach the target", html:`
+      <p>Keep adding points until the score reaches 100, counting how many rounds it takes. You don't know the number of rounds in advance — so WHILE, not FOR.</p>`,
+     py:`# Rounds to reach 100
+score = 0
+rounds = 0
+while score < 100:
+    score = score + 30
+    rounds = rounds + 1
+print("Rounds needed:", rounds)   # 4`,
+     pc:`// Rounds to reach 100
+Score ← 0
+Rounds ← 0
+WHILE Score < 100 DO
+    Score ← Score + 30
+    Rounds ← Rounds + 1
+ENDWHILE
+OUTPUT "Rounds needed: ", Rounds`,
+     after:`<div class="exam"><h3>What examiners look for</h3><p>Two things cost marks on WHILE questions: forgetting to <b>change the condition variable</b> inside the loop (an infinite loop), and the <b>boundary</b> — whether the loop should stop at, just before, or just after the target. Trace the first and last passes by hand.</p></div>`}
+  ],
+
+  practise:[
+    {type:"value", title:"Predict the output", ref:"8.1.4c",
+     prompt:"What does this print (write the numbers, separated by spaces or on lines)?",
+     lang:"py", code:`n = 1
+while n <= 4:
+    print(n)
+    n = n + 1`,
+     fields:[{label:"Numbers printed",a:["1 2 3 4","1,2,3,4","1234"]}],
+     why:"n is 1, 2, 3, 4 (it stops when n becomes 5, because 5 <= 4 is False). <b>1 2 3 4</b>."},
+    {type:"mcq", title:"Why does it never stop?", ref:"8.1.4c / 7.8",
+     prompt:"This loop runs forever. Why?",
+     lang:"py", code:`lives = 3
+while lives > 0:
+    print("Still playing")`,
+     options:[
+       {t:"Nothing inside the loop changes <code>lives</code>, so the condition stays true", ok:true, why:"Correct. lives is always 3, so <code>lives &gt; 0</code> never becomes false. Add <code>lives = lives - 1</code> inside the loop."},
+       {t:"The condition should use <code>>=</code>", why:"The operator isn't the problem — the loop variable never changes, so it can never stop."},
+       {t:"<code>while</code> loops always run forever", why:"No — a WHILE stops as soon as its condition is false. This one's condition just never becomes false."},
+       {t:"<code>print</code> can't go inside a loop", why:"print is fine inside a loop. The missing part is a line that changes lives."}
+     ]},
+    {type:"value", title:"Trace the loop", ref:"8.1.4c",
+     prompt:"What is the final value printed?",
+     lang:"py", code:`total = 0
+n = 1
+while n <= 3:
+    total = total + n
+    n = n + 1
+print(total)`,
+     fields:[{label:"Output",a:["6"]}],
+     why:"total gains 1, then 2, then 3 (n stops at 4). 1 + 2 + 3 = <b>6</b>."},
+    {type:"mcq", title:"WHILE or FOR?", ref:"8.1.4c",
+     prompt:"You must keep asking for a password <b>until</b> the user gets it right. Which loop fits best?",
+     options:[
+       {t:"A WHILE loop", ok:true, why:"Correct. You don't know how many tries it takes, so a condition-controlled WHILE is right."},
+       {t:"A FOR loop", code:false, why:"A FOR loop needs a known number of repeats. You don't know how many guesses the user needs."},
+       {t:"No loop — one IF is enough", why:"An IF checks once; it can't keep re-asking. You need a loop."},
+       {t:"A CASE statement", why:"CASE is selection, not repetition."}
+     ]},
+    {type:"mcq", title:"Correct WHILE in pseudocode", ref:"8.1.4c",
+     prompt:"Which is a correctly written Cambridge pre-condition loop?",
+     options:[
+       {t:"WHILE Count < 10 DO ... ENDWHILE", code:true, ok:true, why:"Correct. WHILE ... DO opens it and ENDWHILE closes it."},
+       {t:"WHILE Count < 10 ... NEXT Count", code:true, why:"NEXT belongs to a FOR loop. A WHILE is closed with ENDWHILE."},
+       {t:"WHILE Count < 10 DO ... UNTIL Count = 10", code:true, why:"That mixes WHILE with REPEAT's UNTIL. A WHILE is closed with ENDWHILE."},
+       {t:"LOOP WHILE Count < 10 ... ENDLOOP", code:true, why:"The keyword is WHILE ... DO ... ENDWHILE, not LOOP/ENDLOOP."}
+     ]},
+    {type:"classify", title:"Runs, or skipped entirely?", ref:"8.1.4c",
+     prompt:"A loop is <code>WHILE Count &lt; 5 DO</code>. For each starting value of Count, does the body run at least once, or is it skipped?",
+     options:["Runs at least once","Skipped (runs 0 times)"],
+     items:[
+       {t:"Count starts at 0", a:"Runs at least once", why:"0 &lt; 5 is true, so the body runs."},
+       {t:"Count starts at 5", a:"Skipped (runs 0 times)", why:"5 &lt; 5 is false at the first test, so the body is skipped — that's a pre-condition loop."},
+       {t:"Count starts at 4", a:"Runs at least once", why:"4 &lt; 5 is true, so it runs."},
+       {t:"Count starts at 10", a:"Skipped (runs 0 times)", why:"10 &lt; 5 is false straight away, so it never runs."}
+     ]}
+  ],
+
+  apply:[
+    {id:"a1", marks:6, title:"Validate the input", context:"Quiz",
+     brief:`<p>Write a Python program that keeps asking for a number from <b>1 to 10</b> until the user enters a valid one, then outputs a message containing the accepted number.</p>
+      <ul><li>read a whole number</li>
+      <li>while it is <b>below 1 or above 10</b>, show a message and ask again</li>
+      <li>when it is valid (1–10 inclusive), output it with a message</li>
+      <li>include at least one comment.</li></ul>`,
+     example:[["out","Enter 1-10: "],["in","0"],["out","Out of range, try again\n"],["out","Enter 1-10: "],["in","7"],["out","Accepted: 7"]],
+     tests:[
+       {label:"Two bad, then valid", kind:"abnormal", inputs:["0","15","7"], expect:"Accepted 7"},
+       {label:"Valid first time", kind:"normal", inputs:["5"], expect:"Accepted 5"},
+       {label:"One bad, then valid", kind:"abnormal", inputs:["11","3"], expect:"Accepted 3"}
+     ],
+     hints:[
+       "Read once before the loop, so there is a value to test.",
+       "Loop while it is out of range: <code>while number < 1 or number > 10:</code>, and read again inside.",
+       "After the loop the number must be valid, so output it there."
+     ],
+     model:{py:`# Validate a number 1-10
+number = int(input("Enter 1-10: "))     # first attempt
+while number < 1 or number > 10:
+    print("Out of range, try again")
+    number = int(input("Enter 1-10: "))
+print("Accepted:", number)`,
+       pc:`// Validate a number 1-10
+INPUT Number
+WHILE Number < 1 OR Number > 10 DO
+    OUTPUT "Out of range, try again"
+    INPUT Number
+ENDWHILE
+OUTPUT "Accepted: ", Number`},
+     mark(R){
+       const {info,H}=R, pts=[], [r0,r1,r2]=R.runs;
+       pts.push((info.constructs||[]).includes("while")? H.yes("Uses a WHILE (condition-controlled) loop","8.1.4c","A while loop re-asks until the input is valid.")
+         : H.no("Uses a WHILE (condition-controlled) loop","8.1.4c","Use a <code>while</code> loop — you don't know how many tries the user needs."));
+       const ints=info.inputs.filter(i=>i.conv==="int").length;
+       pts.push(info.inputs.length>=1&&ints>=1? H.yes("Reads the number with int()","8.1.3","The input is converted to a whole number.")
+         : H.no("Reads the number with int()","8.1.3","Read the number with <code>int(input(...))</code>."));
+       pts.push(!r0.error&&H.hasNum(r0,7)? H.yes("Rejects invalid input and keeps asking","8.1.4c","0 and 15 are refused; 7 is accepted.")
+         : H.no("Rejects invalid input and keeps asking","8.1.4c", r0.error?"The program stopped with an error — does it read again inside the loop?":"After 0 and 15 (both invalid), the accepted number should be 7. Keep looping while the value is out of range."));
+       pts.push(!r1.error&&H.hasNum(r1,5)? H.yes("Accepts a valid number first time","8.1.4c","5 is valid, so the loop is skipped and 5 is accepted.")
+         : H.no("Accepts a valid number first time","8.1.4c", r1.error?"With a valid first input the loop should be skipped — it shouldn't ask again.":"A valid first input (5) should be accepted straight away."));
+       pts.push(!r2.error&&H.hasNum(r2,3)? H.yes("Works after one invalid try","8.1.4c","11 is refused, then 3 is accepted.")
+         : H.no("Works after one invalid try","8.1.4c","After 11 (invalid), the accepted number should be 3."));
+       const attempted=H.attempted(pts);
+       pts.push(H.commentPoint(info, attempted));
+       return pts;
+     }},
+
+    {id:"a2", marks:5, title:"Add until zero", context:"Shopping",
+     brief:`<p>Write a Python program that keeps reading whole numbers and adding them to a total, <b>stopping when the user enters 0</b> (the sentinel). Then output the total.</p>
+      <p>Use a running total and a <b>WHILE</b> loop. 0 is the stop value — it is not added.</p>`,
+     example:[["out","Number (0 to stop): "],["in","10"],["out","Number (0 to stop): "],["in","20"],["out","Number (0 to stop): "],["in","0"],["out","Total: 30"]],
+     tests:[
+       {label:"Three then stop", kind:"normal", inputs:["10","20","5","0"], expect:"Total 35"},
+       {label:"Stop immediately", kind:"extreme", inputs:["0"], expect:"Total 0"},
+       {label:"One then stop", kind:"normal", inputs:["7","0"], expect:"Total 7"}
+     ],
+     hints:[
+       "Start <code>total = 0</code>, then read the first number before the loop.",
+       "Loop <code>while number != 0:</code> — add the number, then read the next one.",
+       "Because you read before the loop and again inside it, entering 0 first stops straight away."
+     ],
+     model:{py:`# Add until zero
+total = 0
+number = int(input("Number (0 to stop): "))
+while number != 0:
+    total = total + number
+    number = int(input("Number (0 to stop): "))
+print("Total:", total)`,
+       pc:`// Add until zero
+Total ← 0
+INPUT Number
+WHILE Number <> 0 DO
+    Total ← Total + Number
+    INPUT Number
+ENDWHILE
+OUTPUT "Total: ", Total`},
+     mark(R){
+       const {info,H}=R, pts=[], [r0,r1,r2]=R.runs;
+       pts.push((info.constructs||[]).includes("while")? H.yes("Uses a WHILE loop with a sentinel","8.1.4c","The loop runs until 0 is entered.")
+         : H.no("Uses a WHILE loop with a sentinel","8.1.4c","Use a <code>while</code> loop that stops when the number is 0."));
+       const ints=info.inputs.filter(i=>i.conv==="int").length;
+       pts.push(info.inputs.length>=1&&ints>=1? H.yes("Reads whole numbers with int()","8.1.3","Each number is read as a whole number.")
+         : H.no("Reads whole numbers with int()","8.1.3","Read each number with <code>int(input(...))</code>."));
+       pts.push(!r0.error&&H.hasNum(r0,35)? H.yes("Correct total before the sentinel","8.1.4c","10 + 20 + 5 = 35, and 0 stops it.")
+         : H.no("Correct total before the sentinel","8.1.4c", r0.error?"The program stopped with an error — does it read the next number inside the loop?":"We expected 35. Add each number before reading the next, and stop at 0."));
+       pts.push(!r1.error&&H.hasNum(r1,0)? H.yes("Stops immediately on 0","8.1.4c","Entering 0 first gives a total of 0 — the sentinel isn't added.")
+         : H.no("Stops immediately on 0","8.1.4c", r1.error?"Entering 0 first should stop at once, not error.":"If the first number is 0, the total should be 0 (0 isn't counted)."));
+       pts.push(!r2.error&&H.hasNum(r2,7)? H.yes("Works for a single number","8.1.4c","7 then 0 gives 7 — the total really follows the input.")
+         : H.no("Works for a single number","8.1.4c","7 then 0 should give a total of 7."));
+       return pts;
+     }}
+  ],
+
+  check:[
+    {type:"trace", source:"exam-style", marks:3, ref:"8.1.4c / 7.7",
+     prompt:"Complete the trace table for this algorithm.",
+     code:`Total ← 0
+Num ← 1
+WHILE Num <= 2 DO
+    Total ← Total + Num
+    Num ← Num + 1
+ENDWHILE
+OUTPUT Total`,
+     cols:["Num","Total","OUTPUT"],
+     rows:[["","0",""],["1","",""],["","1",""],["2","",""],["","3",""],["3","",""],["","","3"]],
+     given:[[0,1]],
+     markCols:[{col:0,label:"Num column: 1, 2, 3"},{col:1,label:"Total column: 0, 1, 3"},{col:2,label:"OUTPUT column: 3"}]},
+    {type:"pseudo", source:"exam-style", marks:3, ref:"8.1.4c",
+     prompt:"Write pseudocode that keeps asking for a <code>Number</code> until the user enters a <b>positive</b> number (more than 0), then outputs it. Use <code>WHILE ... DO ... ENDWHILE</code>.",
+     placeholder:"INPUT Number\nWHILE ... DO\n    ...\n    INPUT Number\nENDWHILE\nOUTPUT Number",
+     model:`INPUT Number
+WHILE Number <= 0 DO
+    OUTPUT "Must be positive"
+    INPUT Number
+ENDWHILE
+OUTPUT Number`,
+     mark(L,H){
+       const pts=[], text=L.map(l=>l.s).join("\n");
+       const wLine=L.find(l=>/^WHILE\b/i.test(l.s));
+       pts.push(wLine&&/<=\s*0|<\s*1/.test(wLine.s)&&/\bDO\b/i.test(wLine.s)? H.yes("WHILE tests for an invalid number, with DO","8.1.4c",`<code>${H.e(wLine.s)}</code>`)
+         : H.no("WHILE tests for an invalid number, with DO","8.1.4c","Loop while the number is invalid: <code>WHILE Number &lt;= 0 DO</code>."));
+       const inputs=(text.match(/\bINPUT\b/ig)||[]).length;
+       pts.push(inputs>=2? H.yes("Reads again inside the loop","8.1.4c","An INPUT before the loop and another inside it, so a wrong answer gets another go.")
+         : H.no("Reads again inside the loop","8.1.4c","Put an <code>INPUT Number</code> inside the loop as well, or it can never change."));
+       pts.push(/\bENDWHILE\b/i.test(text)? H.yes("Closed with ENDWHILE","8.1.4c","The loop is closed properly.")
+         : H.no("Closed with ENDWHILE","8.1.4c","Close a WHILE loop with <code>ENDWHILE</code> (not NEXT or UNTIL)."));
+       return pts;
+     }},
+    {type:"mcq", source:"exam-style", marks:1, ref:"8.1.4c",
+     prompt:"A WHILE loop's condition is <b>already false</b> the first time it is checked. How many times does the loop body run?",
+     options:[
+       {t:"Zero times", ok:true, why:"Correct. A WHILE (pre-condition) loop tests before each pass, so if the condition is false at the start, the body never runs."},
+       {t:"Once", why:"That would be a REPEAT (post-condition) loop, which always runs at least once. A WHILE can run zero times."},
+       {t:"Forever", why:"If the condition is false it stops immediately — it doesn't run at all."},
+       {t:"It depends on ENDWHILE", why:"ENDWHILE just marks the end; the condition at the top decides whether the body runs."}
+     ]}
+  ]
+};
+
+/* ------------------------------------------------------------
+   SKILL 12 — POST-CONDITION LOOPS (REPEAT) (8.1.4c)
+   ------------------------------------------------------------ */
+SKILLS.s12 = {
+  n:12, title:"Post-condition loops (REPEAT)", ref:"8.1.4(c)",
+  intro:"Sometimes a loop must run at least once — show a menu, take a guess, read a reply — before you can test whether to stop. That's a REPEAT ... UNTIL loop.",
+  learn:[
+    {h:"Test at the bottom", html:`
+      <p>A <b>post-condition</b> loop runs the body <b>first</b>, then checks a condition at the <b>end</b>. Because the test is at the bottom, the body always runs <b>at least once</b>.</p>
+      <p>Cambridge pseudocode: <code>REPEAT ... UNTIL &lt;condition&gt;</code>. The loop <b>stops</b> when the UNTIL condition becomes <b>true</b>.</p>`,
+     py:`# Python has no REPEAT - use while True + break
+count = 0
+while True:
+    count = count + 1
+    print(count)
+    if count == 3:
+        break`,
+     pc:`Count ← 0
+REPEAT
+    Count ← Count + 1
+    OUTPUT Count
+UNTIL Count = 3`,
+     after:`<div class="note">Python has no REPEAT keyword. The standard way to write a post-condition loop is <code>while True:</code> with an <code>if ...: break</code> at the point where it should stop.</div>`},
+
+    {h:"WHILE or REPEAT?", html:`
+      <p>They look similar but differ in two important ways:</p>
+      <div class="tablewrap"><table class="grid">
+        <tr><th></th><th>WHILE (pre-condition)</th><th>REPEAT (post-condition)</th></tr>
+        <tr><th>Test is…</th><td>at the <b>top</b></td><td>at the <b>bottom</b></td></tr>
+        <tr><th>Body runs…</th><td><b>zero</b> or more times</td><td><b>at least once</b></td></tr>
+        <tr><th>Keyword continues while…</th><td>condition is <b>true</b></td><td>condition is <b>false</b> (stops when <b>true</b>)</td></tr>
+      </table></div>`,
+     after:`<div class="note tip">Watch the logic flip: <code>WHILE Valid = FALSE</code> and <code>REPEAT ... UNTIL Valid = TRUE</code> describe the <b>same</b> idea. UNTIL is the <b>stop</b> condition.</div>`},
+
+    {h:"When REPEAT fits best", html:`
+      <p>Use REPEAT when the body <b>must happen at least once</b> before you can decide whether to stop:</p>
+      <ul><li>show a menu, then ask again until the user chooses Quit;</li>
+      <li>take a guess, then check it — you can't check a guess you haven't taken;</li>
+      <li>read a reply, then validate it.</li></ul>`,
+     pc:`REPEAT
+    INPUT Guess
+UNTIL Guess = Secret`,
+     after:`<div class="note">You have to take a guess before you can test it, so the input belongs <b>inside</b> the loop and the check comes after — a natural post-condition loop.</div>`},
+
+    {h:"Worked example: unlock code", html:`
+      <p>Keep asking for a code until the user enters 1234. They must be asked at least once, so REPEAT fits.</p>`,
+     py:`# Unlock
+while True:
+    code = int(input("Enter code: "))
+    if code == 1234:
+        break
+print("Unlocked")`,
+     pc:`// Unlock
+REPEAT
+    INPUT Code
+UNTIL Code = 1234
+OUTPUT "Unlocked"`,
+     after:`<div class="exam"><h3>What examiners look for</h3><p>The common slip is the <b>direction of the condition</b>: UNTIL is where the loop <b>stops</b>, so it is the opposite of a WHILE condition. Also remember a REPEAT body always runs once — so don't use it when the body might need to be skipped entirely (use WHILE for that).</p></div>`}
+  ],
+
+  practise:[
+    {type:"value", title:"Predict the output", ref:"8.1.4c",
+     prompt:"How many numbers does this print, and what is the last one?<br><code>Count ← 0</code><br><code>REPEAT</code><br>&nbsp;&nbsp;<code>Count ← Count + 1</code><br>&nbsp;&nbsp;<code>OUTPUT Count</code><br><code>UNTIL Count = 4</code>",
+     fields:[{label:"How many numbers",a:["4"]},{label:"Last number",a:["4"]}],
+     why:"It outputs 1, 2, 3, 4 and stops when Count reaches 4. Four numbers; the last is <b>4</b>."},
+    {type:"mcq", title:"How is REPEAT different?", ref:"8.1.4c",
+     prompt:"How does a <code>REPEAT ... UNTIL</code> loop differ from a <code>WHILE</code> loop?",
+     options:[
+       {t:"REPEAT always runs the body at least once, because it tests at the end", ok:true, why:"Correct. The test is at the bottom, so the body runs before the condition is ever checked."},
+       {t:"REPEAT can never stop", why:"It stops when its UNTIL condition becomes true — it's a normal, finite loop."},
+       {t:"REPEAT counts automatically like a FOR loop", why:"No — you change the condition variable yourself, as in a WHILE."},
+       {t:"There is no difference", why:"There is: WHILE tests first (may run 0 times); REPEAT tests last (runs ≥ 1 time)."}
+     ]},
+    {type:"mcq", title:"What does UNTIL mean?", ref:"8.1.4c",
+     prompt:"In <code>REPEAT ... UNTIL Score >= 100</code>, when does the loop stop?",
+     options:[
+       {t:"When Score reaches 100 or more (the condition becomes true)", ok:true, why:"Correct. UNTIL is the stop condition: the loop repeats until it is true."},
+       {t:"While Score is 100 or more", why:"That's WHILE thinking. REPEAT stops when the UNTIL condition becomes true, it doesn't continue while it's true."},
+       {t:"When Score is less than 100", why:"No — it keeps going while Score is under 100, and stops when it reaches 100."},
+       {t:"It never stops", why:"It stops as soon as Score >= 100 is true."}
+     ]},
+    {type:"value", title:"Count the passes", ref:"8.1.4c",
+     prompt:"<code>N</code> starts at 1. How many times does the body run?<br><code>REPEAT</code><br>&nbsp;&nbsp;<code>N ← N + 1</code><br><code>UNTIL N > 3</code>",
+     fields:[{label:"Number of passes",a:["3"]}],
+     why:"N goes 1→2 (pass 1), 2→3 (pass 2), 3→4 (pass 3, now 4 &gt; 3, stop). <b>3</b> passes."},
+    {type:"mcq", title:"Correct REPEAT in pseudocode", ref:"8.1.4c",
+     prompt:"Which is a correctly written Cambridge post-condition loop?",
+     options:[
+       {t:"REPEAT ... UNTIL Answer = \"yes\"", code:true, ok:true, why:"Correct. REPEAT opens it; UNTIL <condition> closes it and gives the stop test."},
+       {t:"REPEAT ... ENDREPEAT", code:true, why:"A REPEAT loop is closed by <code>UNTIL &lt;condition&gt;</code>, not ENDREPEAT."},
+       {t:"REPEAT ... WHILE Answer = \"yes\"", code:true, why:"That mixes the two loops. A REPEAT is closed with UNTIL, not WHILE."},
+       {t:"DO ... UNTIL Answer = \"yes\"", code:true, why:"The opening keyword is REPEAT, not DO."}
+     ]},
+    {type:"classify", title:"WHILE or REPEAT?", ref:"8.1.4c",
+     prompt:"Decide whether each job needs a pre-condition (WHILE) or a post-condition (REPEAT) loop.",
+     options:["WHILE (might run 0 times)","REPEAT (runs at least once)"],
+     items:[
+       {t:"Ask for a guess, then check it", a:"REPEAT (runs at least once)", why:"You must take a guess before you can check it — the body runs at least once."},
+       {t:"Give change only while money is still owed", a:"WHILE (might run 0 times)", why:"If nothing is owed, the body should run zero times → WHILE."},
+       {t:"Show a menu, then repeat until Quit is chosen", a:"REPEAT (runs at least once)", why:"The menu must appear at least once → REPEAT."},
+       {t:"Remove items from a basket while it isn't empty", a:"WHILE (might run 0 times)", why:"An empty basket means the body runs zero times → WHILE."}
+     ]}
+  ],
+
+  apply:[
+    {id:"a1", marks:6, title:"Guess the number", context:"Gaming",
+     brief:`<p>The secret number is <b>7</b>. Write a Python program that keeps asking for a guess <b>until</b> the guess is 7, then outputs how many attempts it took (a message containing the number of attempts).</p>
+      <p>Because a guess must be taken before it can be checked, this is a post-condition loop — in Python, <code>while True:</code> with <code>if ...: break</code>.</p>`,
+     example:[["out","Guess: "],["in","3"],["out","Guess: "],["in","7"],["out","Correct in 2 attempts"]],
+     tests:[
+       {label:"Right first time", kind:"normal", inputs:["7"], expect:"1 attempt"},
+       {label:"Three guesses", kind:"normal", inputs:["3","9","7"], expect:"3 attempts"},
+       {label:"Two guesses", kind:"normal", inputs:["1","7"], expect:"2 attempts"}
+     ],
+     hints:[
+       "Count attempts: start <code>attempts = 0</code> and add 1 each pass.",
+       "Loop with <code>while True:</code>, read and count a guess, then <code>if guess == 7: break</code>.",
+       "Output the attempts <b>after</b> the loop."
+     ],
+     model:{py:`# Guess the number
+secret = 7
+attempts = 0
+while True:
+    guess = int(input("Guess: "))
+    attempts = attempts + 1
+    if guess == secret:
+        break
+print("Correct in", attempts, "attempts")`,
+       pc:`// Guess the number
+CONSTANT Secret = 7
+Attempts ← 0
+REPEAT
+    INPUT Guess
+    Attempts ← Attempts + 1
+UNTIL Guess = Secret
+OUTPUT "Correct in ", Attempts, " attempts"`},
+     mark(R){
+       const {info,H}=R, pts=[], [r0,r1,r2]=R.runs;
+       pts.push((info.constructs||[]).includes("while")||(info.constructs||[]).includes("for")? H.yes("Uses a loop that repeats","8.1.4c","A loop keeps asking for a guess.")
+         : H.no("Uses a loop that repeats","8.1.4c","Use a loop (<code>while True:</code> with a <code>break</code>) to keep asking."));
+       const ints=info.inputs.filter(i=>i.conv==="int").length;
+       pts.push(info.inputs.length>=1&&ints>=1? H.yes("Reads the guess with int()","8.1.3","Each guess is read as a whole number.")
+         : H.no("Reads the guess with int()","8.1.3","Read the guess with <code>int(input(...))</code>."));
+       pts.push(!r0.error&&H.hasNum(r0,1)? H.yes("One attempt when right first time","8.1.4c","Guessing 7 first gives 1 attempt — the body ran once.")
+         : H.no("One attempt when right first time","8.1.4c", r0.error?"The program stopped with an error — see above.":"Guessing 7 straight away should report 1 attempt."));
+       pts.push(!r1.error&&H.hasNum(r1,3)? H.yes("Counts three attempts","8.1.4c","3, 9, 7 → 3 attempts.")
+         : H.no("Counts three attempts","8.1.4c","Guesses 3, 9, 7 should report 3 attempts. Add 1 each pass."));
+       pts.push(!r2.error&&H.hasNum(r2,2)? H.yes("Counts two attempts","8.1.4c","1, 7 → 2 attempts — the count really follows the input.")
+         : H.no("Counts two attempts","8.1.4c","Guesses 1, 7 should report 2 attempts."));
+       const attempted=H.attempted(pts);
+       pts.push(H.commentPoint(info, attempted));
+       return pts;
+     }},
+
+    {id:"a2", marks:5, title:"Doublings past 100", context:"Maths",
+     brief:`<p>Write a Python program that reads a starting whole number, then <b>repeatedly doubles it</b> until it is <b>more than 100</b>, and outputs how many doublings that took.</p>
+      <p>Double first, then test — a post-condition loop. For a start of 10: 20, 40, 80, 160 → <b>4</b> doublings.</p>`,
+     example:[["out","Start: "],["in","10"],["out","Doublings: 4"]],
+     tests:[
+       {label:"Start 10", kind:"normal", inputs:["10"], expect:"4"},
+       {label:"Start 50", kind:"normal", inputs:["50"], expect:"2"},
+       {label:"Start 200 (already big)", kind:"extreme", inputs:["200"], expect:"1"}
+     ],
+     hints:[
+       "Count the doublings: start <code>count = 0</code> and add 1 each time you double.",
+       "Loop with <code>while True:</code>: double the value and count, then <code>if value > 100: break</code>.",
+       "Because you double before testing, even a large start doubles at least once."
+     ],
+     model:{py:`# Doublings past 100
+value = int(input("Start: "))
+count = 0
+while True:
+    value = value * 2
+    count = count + 1
+    if value > 100:
+        break
+print("Doublings:", count)`,
+       pc:`// Doublings past 100
+INPUT Value
+Count ← 0
+REPEAT
+    Value ← Value * 2
+    Count ← Count + 1
+UNTIL Value > 100
+OUTPUT "Doublings: ", Count`},
+     mark(R){
+       const {info,H}=R, pts=[], [r0,r1,r2]=R.runs;
+       pts.push((info.constructs||[]).includes("while")||(info.constructs||[]).includes("for")? H.yes("Uses a loop that runs at least once","8.1.4c","A post-condition loop doubles then tests.")
+         : H.no("Uses a loop that runs at least once","8.1.4c","Use a loop (<code>while True:</code> with a <code>break</code>) that doubles then tests."));
+       const ints=info.inputs.filter(i=>i.conv==="int").length;
+       pts.push(info.inputs.length>=1&&ints>=1? H.yes("Reads the start as a whole number","8.1.3","Read with int(input()).")
+         : H.no("Reads the start as a whole number","8.1.3","Read the starting number with <code>int()</code>."));
+       pts.push(!r0.error&&H.hasNum(r0,4)? H.yes("4 doublings from 10","8.1.4c","20, 40, 80, 160 → 4.")
+         : H.no("4 doublings from 10","8.1.4c", r0.error?"It stopped with an error — see above.":"From 10 it should take 4 doublings to pass 100."));
+       pts.push(!r1.error&&H.hasNum(r1,2)? H.yes("2 doublings from 50","8.1.4c","100, then 200 → 2.")
+         : H.no("2 doublings from 50","8.1.4c","From 50 it should take 2 doublings (100, then 200)."));
+       pts.push(!r2.error&&H.hasNum(r2,1)? H.yes("Runs at least once (start 200)","8.1.4c","200 is already big, but it still doubles once → 1 — that's the post-condition.")
+         : H.no("Runs at least once (start 200)","8.1.4c","Even a start of 200 should double once (to 400) and report 1 — test at the bottom, not the top."));
+       return pts;
+     }}
+  ],
+
+  check:[
+    {type:"trace", source:"exam-style", marks:3, ref:"8.1.4c / 7.7",
+     prompt:"Complete the trace table for this algorithm.",
+     code:`Total ← 0
+Num ← 0
+REPEAT
+    Num ← Num + 1
+    Total ← Total + Num
+UNTIL Num = 2
+OUTPUT Total`,
+     cols:["Num","Total","OUTPUT"],
+     rows:[["","0",""],["0","",""],["1","",""],["","1",""],["2","",""],["","3",""],["","","3"]],
+     given:[[0,1]],
+     markCols:[{col:0,label:"Num column: 0, 1, 2"},{col:1,label:"Total column: 0, 1, 3"},{col:2,label:"OUTPUT column: 3"}]},
+    {type:"pseudo", source:"exam-style", marks:3, ref:"8.1.4c",
+     prompt:"Write pseudocode that keeps asking for a <code>Password</code> until the user enters <code>\"OPEN\"</code>, then outputs <code>\"Unlocked\"</code>. Use <code>REPEAT ... UNTIL</code>.",
+     placeholder:"REPEAT\n    INPUT Password\nUNTIL ...\nOUTPUT \"Unlocked\"",
+     model:`REPEAT
+    INPUT Password
+UNTIL Password = "OPEN"
+OUTPUT "Unlocked"`,
+     mark(L,H){
+       const pts=[], text=L.map(l=>l.s).join("\n");
+       pts.push(/^REPEAT$/im.test(text)||/\bREPEAT\b/i.test(text)? H.yes("Opens with REPEAT","8.1.4c","The loop starts with REPEAT.")
+         : H.no("Opens with REPEAT","8.1.4c","Start the loop with <code>REPEAT</code> on its own line."));
+       const untilLine=L.find(l=>/^UNTIL\b/i.test(l.s));
+       pts.push(untilLine&&/Password\s*=\s*"?OPEN"?/i.test(untilLine.s)? H.yes("Stops with UNTIL Password = \"OPEN\"","8.1.4c",`<code>${H.e(untilLine.s)}</code> — UNTIL is the stop condition.`)
+         : H.no("Stops with UNTIL Password = \"OPEN\"","8.1.4c","Close the loop with <code>UNTIL Password = \"OPEN\"</code> — that's when it should stop."));
+       const inIdx=L.findIndex(l=>/^INPUT\b/i.test(l.s)), upIdx=L.findIndex(l=>/^UNTIL\b/i.test(l.s));
+       pts.push(inIdx>=0&&(upIdx<0||inIdx<upIdx)? H.yes("Reads the password inside the loop","8.1.4c","The INPUT is inside the REPEAT, so it asks again each time.")
+         : H.no("Reads the password inside the loop","8.1.4c","Put <code>INPUT Password</code> inside the loop (before UNTIL)."));
+       return pts;
+     }},
+    {type:"mcq", source:"exam-style", marks:1, ref:"8.1.4c",
+     prompt:"A program must show a menu and act on the choice, then repeat <b>until</b> the user picks “Exit”. Which loop fits best?",
+     options:[
+       {t:"REPEAT ... UNTIL choice = \"Exit\"", ok:true, why:"Correct. The menu must appear at least once, and you test after acting — a post-condition loop."},
+       {t:"A FOR loop", why:"You don't know how many times the user will use the menu, so a count-controlled loop doesn't fit."},
+       {t:"A single IF", why:"An IF runs once and can't repeat the menu."},
+       {t:"A WHILE loop that can run zero times", why:"The menu must show at least once, so a post-condition REPEAT is the better fit than a pre-condition WHILE."}
+     ]}
+  ]
+};
+
+/* ------------------------------------------------------------
+   SKILL 13 — NESTED STATEMENTS (8.1.5)
+   ------------------------------------------------------------ */
+SKILLS.s13 = {
+  n:13, title:"Nested statements", ref:"8.1.5",
+  intro:"Put one structure inside another — a decision inside a loop, a loop inside a loop. Nesting is how real programs do a check on every item, or work across a grid.",
+  learn:[
+    {h:"One structure inside another", html:`
+      <p><b>Nesting</b> means placing a selection or loop <b>inside</b> another. The <b>indentation</b> shows what is inside what: anything indented further belongs to the structure above it.</p>
+      <p>The most common pattern is a <b>decision inside a loop</b> — do a test on <b>every</b> item.</p>`,
+     py:`for i in range(1, 6):
+    if i == 3:
+        print("three!")
+    else:
+        print(i)`,
+     pc:`FOR I ← 1 TO 5
+    IF I = 3 THEN
+        OUTPUT "three!"
+    ELSE
+        OUTPUT I
+    ENDIF
+NEXT I`,
+     after:`<div class="note">The IF is indented inside the FOR, so it runs <b>once per pass</b> — five times in all. The ENDIF closes the IF; the NEXT closes the FOR. Each opener has its own closer, lined up underneath it.</div>`},
+
+    {h:"Indentation decides everything", html:`
+      <p>Moving a line in or out changes which structure it belongs to. Compare:</p>`,
+     py:`# A: the print is INSIDE the loop - runs 3 times
+for i in range(3):
+    print("Hi")
+
+# B: the print is OUTSIDE the loop - runs once
+for i in range(3):
+    pass
+print("Hi")`,
+     after:`<div class="note tip">In Python the indentation <i>is</i> the structure. In Cambridge pseudocode the <code>ENDIF</code>, <code>NEXT</code> and <code>ENDWHILE</code> keywords mark where each block ends — but you still indent to make the nesting clear.</div>`},
+
+    {h:"A loop inside a loop", html:`
+      <p>Nest a loop inside a loop to work across a <b>grid</b>: the <b>inner</b> loop runs all the way through for <b>each</b> pass of the <b>outer</b> loop.</p>`,
+     py:`for row in range(1, 3):        # 2 rows
+    for col in range(1, 4):    # 3 columns each
+        print(row, col)`,
+     after:`<div class="note">That prints 2 × 3 = <b>6</b> lines: (1,1) (1,2) (1,3) (2,1) (2,2) (2,3). The inner loop finishes completely before the outer loop moves on.</div>`},
+
+    {h:"Worked example: count the passes", html:`
+      <p>Check every mark in a list and count how many are 50 or more. A loop reads each mark; an IF inside it does the check.</p>`,
+     py:`# Count the passes
+passes = 0
+for i in range(5):
+    mark = int(input("Mark: "))
+    if mark >= 50:
+        passes = passes + 1
+print("Passes:", passes)`,
+     pc:`// Count the passes
+Passes ← 0
+FOR I ← 1 TO 5
+    INPUT Mark
+    IF Mark >= 50 THEN
+        Passes ← Passes + 1
+    ENDIF
+NEXT I
+OUTPUT "Passes: ", Passes`,
+     after:`<div class="exam"><h3>What examiners look for</h3><p>Nesting questions reward correct <b>indentation</b> and <b>matching closers</b> (every IF an ENDIF, every FOR a NEXT). The usual slip is a line at the wrong level — a counter updated outside the loop, or an output inside it that should be after it. Trace one full pass to check each line is where it belongs.</p></div>`}
+  ],
+
+  practise:[
+    {type:"value", title:"Trace the loop and IF", ref:"8.1.5",
+     prompt:"What is printed?",
+     lang:"py", code:`total = 0
+for n in range(1, 5):
+    if n % 2 == 0:
+        total = total + n
+print(total)`,
+     fields:[{label:"Output",a:["6"]}],
+     why:"n is 1, 2, 3, 4. The IF adds only the even ones: 2 + 4 = <b>6</b>. (1 and 3 are skipped.)"},
+    {type:"mcq", title:"What does indentation decide?", ref:"8.1.5",
+     prompt:"In the code below, how many times does <code>print(\"Done\")</code> run?",
+     lang:"py", code:`for i in range(3):
+    print(i)
+print("Done")`,
+     options:[
+       {t:"Once — it is outside the loop", ok:true, why:"Correct. <code>print(\"Done\")</code> is not indented, so it runs once, after the loop finishes."},
+       {t:"Three times — it is inside the loop", why:"It isn't indented under the loop, so it runs once, not each pass."},
+       {t:"Four times", why:"The loop runs three times (0, 1, 2); the un-indented line runs once after it."},
+       {t:"It causes an error", why:"The code is valid; indentation decides that “Done” prints once at the end."}
+     ]},
+    {type:"value", title:"Nested loops", ref:"8.1.5",
+     prompt:"How many lines does this print?",
+     lang:"py", code:`for a in range(2):
+    for b in range(3):
+        print(a, b)`,
+     fields:[{label:"Number of lines",a:["6"]}],
+     why:"The inner loop (3 passes) runs fully for each of the outer loop's 2 passes: 2 × 3 = <b>6</b> lines."},
+    {type:"mcq", title:"Name the structure", ref:"8.1.5",
+     prompt:"A program reads 10 scores and, for each one, prints “High” if it is over 100. What is nested in what?",
+     options:[
+       {t:"A selection (IF) inside a loop (FOR)", ok:true, why:"Correct. The loop repeats for each score; the IF does the check on every pass — selection inside iteration."},
+       {t:"A loop inside a selection", why:"The repetition is the outer structure (one check per score), so the IF is inside the loop, not the other way round."},
+       {t:"Two loops, one inside the other", why:"There's only one loop here; the inner structure is a decision, not a second loop."},
+       {t:"No nesting at all", why:"The IF sits inside the loop, so this is nested."}
+     ]},
+    {type:"mcq", title:"Spot the error", ref:"8.1.5 / 7.8",
+     prompt:"This should count how many of three numbers are positive, but it always prints 1. Which line is at the wrong level?",
+     lang:"py", code:`count = 0
+for i in range(3):
+    n = int(input("Number: "))
+if n > 0:
+    count = count + 1
+print(count)`,
+     options:[
+       {t:"Line 4 — the IF should be indented inside the loop", ok:true, why:"Correct. The IF isn't indented, so it runs once after the loop, checking only the last number. It belongs inside the loop."},
+       {t:"Line 2 — the range is wrong", why:"range(3) correctly loops three times. The problem is that the check isn't inside the loop."},
+       {t:"Line 1 — count starts wrong", why:"Starting count at 0 is correct. The real issue is the IF running outside the loop."},
+       {t:"Nothing is wrong", why:"Run it: the IF checks only the final number, so the count is at most 1. It must be indented into the loop."}
+     ]},
+    {type:"classify", title:"Inside the loop or after it?", ref:"8.1.5",
+     prompt:"A FOR loop adds up scores. For a correct running total that prints once, where does each line belong?",
+     options:["Inside the loop","After the loop"],
+     items:[
+       {t:"total = total + score", code:true, a:"Inside the loop", why:"It must run for every score, so it goes inside the loop."},
+       {t:"score = int(input())", code:true, a:"Inside the loop", why:"You read a new score each pass, so it's inside the loop."},
+       {t:"print(total)", code:true, a:"After the loop", why:"You want the total printed once, at the end — after the loop."},
+       {t:"total = 0", code:true, a:"After the loop", why:"Careful — this one goes <b>before</b> the loop, not inside or after. Setting it inside would reset it every pass."}
+     ]}
+  ],
+
+  apply:[
+    {id:"a1", marks:6, title:"Count the passes", context:"Exam",
+     brief:`<p>Write a Python program that:</p>
+      <ul><li>asks <b>how many</b> marks there are (a whole number)</li>
+      <li>uses a <b>loop</b> to read that many marks</li>
+      <li>with an <b>IF inside the loop</b>, counts how many are <b>50 or more</b></li>
+      <li>outputs the count, and includes at least one comment.</li></ul>`,
+     example:[["out","How many marks? "],["in","4"],["out","Mark: "],["in","55"],["out","Mark: "],["in","40"],["out","Mark: "],["in","70"],["out","Mark: "],["in","50"],["out","Passes: 3"]],
+     tests:[
+       {label:"Four marks, three pass", kind:"normal", inputs:["4","55","40","70","50"], expect:"Passes 3"},
+       {label:"One mark, none pass", kind:"normal", inputs:["1","30"], expect:"Passes 0"},
+       {label:"Boundary 50 passes", kind:"extreme", inputs:["3","50","49","100"], expect:"Passes 2"}
+     ],
+     hints:[
+       "Read the count, then loop with <code>for i in range(count):</code>.",
+       "Inside the loop, read a mark and use <code>if mark >= 50:</code> to count it.",
+       "Keep a <code>passes</code> counter that starts at 0 before the loop."
+     ],
+     model:{py:`# Count the passes
+count = int(input("How many marks? "))   # how many to read
+passes = 0
+for i in range(count):
+    mark = int(input("Mark: "))
+    if mark >= 50:
+        passes = passes + 1
+print("Passes:", passes)`,
+       pc:`// Count the passes
+INPUT Count
+Passes ← 0
+FOR I ← 1 TO Count
+    INPUT Mark
+    IF Mark >= 50 THEN
+        Passes ← Passes + 1
+    ENDIF
+NEXT I
+OUTPUT "Passes: ", Passes`},
+     mark(R){
+       const {info,H}=R, pts=[], [r0,r1,r2]=R.runs, c=info.constructs||[];
+       pts.push(c.includes("for")||c.includes("while")? H.yes("Uses a loop to read the marks","8.1.4c","A loop reads each mark in turn.")
+         : H.no("Uses a loop to read the marks","8.1.4c","Use a loop to read the marks instead of separate input lines."));
+       pts.push(info.nested&&c.includes("if")? H.yes("A decision (IF) nested inside the loop","8.1.5","The IF sits inside the loop, so every mark is checked.")
+         : H.no("A decision (IF) nested inside the loop","8.1.5","Put the <code>if mark >= 50:</code> <b>inside</b> the loop so each mark is checked."));
+       const ints=info.inputs.filter(i=>i.conv==="int").length;
+       pts.push(info.inputs.length>=1&&ints>=1? H.yes("Reads whole numbers with int()","8.1.3","The count and marks are read as whole numbers.")
+         : H.no("Reads whole numbers with int()","8.1.3","Read the count and each mark with <code>int(input(...))</code>."));
+       pts.push(!r0.error&&H.hasNum(r0,3)? H.yes("Correct count: 3 of 4 pass","8.1.5","55, 70 and 50 are 50+; 40 is not.")
+         : H.no("Correct count: 3 of 4 pass","8.1.5", r0.error?"The program stopped with an error — is the IF inside the loop?":"For 55, 40, 70, 50 the count should be 3 (50 passes)."));
+       pts.push(!r1.error&&H.hasNum(r1,0)? H.yes("Counts 0 when none pass","8.1.5","A single 30 gives 0 — the count really depends on the marks.")
+         : H.no("Counts 0 when none pass","8.1.5","A single mark of 30 should give a count of 0."));
+       const attempted=H.attempted(pts);
+       pts.push(H.commentPoint(info, attempted));
+       return pts;
+     }},
+
+    {id:"a2", marks:5, title:"Star rectangle", context:"Graphics",
+     brief:`<p>Write a Python program that reads a number of <b>rows</b> and a number of <b>columns</b> (whole numbers), then prints a rectangle of <code>*</code> stars that size — using a <b>loop inside a loop</b>.</p>
+      <p>For 2 rows and 3 columns it prints two lines of three stars:</p>
+      <pre class="term">***
+***</pre>`,
+     example:[["out","Rows: "],["in","2"],["out","Columns: "],["in","3"],["out","***\n***"]],
+     tests:[
+       {label:"2 by 3", kind:"normal", inputs:["2","3"], expect:"two lines of 3 stars"},
+       {label:"3 by 1", kind:"normal", inputs:["3","1"], expect:"three lines of 1 star"}
+     ],
+     hints:[
+       "Read rows and columns with <code>int(input(...))</code>.",
+       "Outer loop once per row; inner loop builds that row's stars.",
+       "Build a line with <code>line = line + \"*\"</code> in the inner loop, then print the line."
+     ],
+     model:{py:`# Star rectangle
+rows = int(input("Rows: "))
+cols = int(input("Columns: "))
+for r in range(rows):
+    line = ""
+    for c in range(cols):
+        line = line + "*"
+    print(line)`,
+       pc:`// Star rectangle
+INPUT Rows
+INPUT Cols
+FOR R ← 1 TO Rows
+    Line ← ""
+    FOR C ← 1 TO Cols
+        Line ← Line & "*"
+    NEXT C
+    OUTPUT Line
+NEXT R`},
+     mark(R){
+       const {info,H}=R, pts=[], [r0,r1]=R.runs, c=info.constructs||[];
+       const stars=s=>(H.printed(s).match(/\*/g)||[]).length;
+       const lines=s=>H.printed(s).trim().length?H.printed(s).trim().split(/\n/).length:0;
+       const ints=info.inputs.filter(i=>i.conv==="int").length;
+       pts.push(info.inputs.length>=2&&ints>=2? H.yes("Reads rows and columns with int()","8.1.3","Two whole numbers are read.")
+         : H.no("Reads rows and columns with int()","8.1.3","Read both the rows and columns with <code>int(input(...))</code>."));
+       pts.push(c.includes("for")||c.includes("while")? H.yes("Uses a loop","8.1.4c","A loop builds the rows.")
+         : H.no("Uses a loop","8.1.4c","Use a loop to repeat for each row."));
+       pts.push(info.nested? H.yes("A loop nested inside a loop","8.1.5","The inner loop builds each row inside the outer loop.")
+         : H.no("A loop nested inside a loop","8.1.5","Put one loop inside the other: an inner loop for the columns, inside the outer loop for the rows."));
+       pts.push(!r0.error&&stars(r0)===6&&lines(r0)===2? H.yes("Correct for 2 by 3","8.1.5","Two lines of three stars — six stars in all.")
+         : H.no("Correct for 2 by 3","8.1.5", r0.error?"The program stopped with an error — see above.":`2 rows of 3 columns should print two lines of three stars (six in total). We counted ${stars(r0)} star(s) on ${lines(r0)} line(s).`));
+       pts.push(!r1.error&&stars(r1)===3&&lines(r1)===3? H.yes("Correct for 3 by 1","8.1.5","Three lines of one star — the size follows the input.")
+         : H.no("Correct for 3 by 1","8.1.5","3 rows of 1 column should print three lines of one star."));
+       return pts;
+     }}
+  ],
+
+  check:[
+    {type:"trace", source:"exam-style", marks:3, ref:"8.1.5 / 7.7",
+     prompt:"Complete the trace table. <code>MOD(N, 2) = 0</code> is true when N is even.",
+     code:`Total ← 0
+FOR N ← 1 TO 4
+    IF MOD(N, 2) = 0 THEN
+        Total ← Total + N
+    ENDIF
+NEXT N
+OUTPUT Total`,
+     cols:["N","Total","OUTPUT"],
+     rows:[["","0",""],["1","",""],["2","",""],["","2",""],["3","",""],["4","",""],["","6",""],["","","6"]],
+     given:[[0,1]],
+     markCols:[{col:0,label:"N column: 1, 2, 3, 4"},{col:1,label:"Total column: 0, 2, 6 (adds only even N)"},{col:2,label:"OUTPUT column: 6"}]},
+    {type:"pseudo", source:"exam-style", marks:3, ref:"8.1.5",
+     prompt:"Write pseudocode that, for each number from <b>1 to 5</b>, outputs <code>\"Even\"</code> if it is even and <code>\"Odd\"</code> if it is odd. Use a <b>FOR loop with an IF inside it</b>. (<code>MOD(N, 2) = 0</code> means N is even.)",
+     placeholder:"FOR N ← 1 TO 5\n    IF ... THEN\n        OUTPUT ...\n    ELSE\n        OUTPUT ...\n    ENDIF\nNEXT N",
+     model:`FOR N ← 1 TO 5
+    IF MOD(N, 2) = 0 THEN
+        OUTPUT "Even"
+    ELSE
+        OUTPUT "Odd"
+    ENDIF
+NEXT N`,
+     mark(L,H){
+       const pts=[], text=L.map(l=>l.s).join("\n");
+       const forLine=L.find(l=>/^FOR\b/i.test(l.s));
+       pts.push(forLine&&/FOR\s+\w+\s*←\s*1\s+TO\s+5/i.test(forLine.s)&&/\bNEXT\b/i.test(text)? H.yes("FOR loop 1 TO 5, closed with NEXT","8.1.5",`<code>${H.e(forLine.s)}</code>`)
+         : H.no("FOR loop 1 TO 5, closed with NEXT","8.1.5","Loop with <code>FOR N ← 1 TO 5</code> ... <code>NEXT N</code>."));
+       const hasIf=/\bIF\b/i.test(text)&&/\bENDIF\b/i.test(text), hasEven=/even/i.test(text), hasOdd=/odd/i.test(text), hasElse=/\bELSE\b/i.test(text);
+       pts.push(hasIf&&hasEven&&hasOdd&&hasElse? H.yes("IF ... ELSE ... ENDIF chooses Even or Odd","8.1.5","A selection inside the loop outputs Even or Odd.")
+         : H.no("IF ... ELSE ... ENDIF chooses Even or Odd","8.1.5","Inside the loop, use <code>IF ... THEN OUTPUT \"Even\" ELSE OUTPUT \"Odd\" ENDIF</code>."));
+       const cond=/MOD\s*\(\s*N\s*,\s*2\s*\)\s*=\s*0/i.test(text)||/N\s+MOD\s+2\s*=\s*0/i.test(text);
+       pts.push(cond? H.yes("Correct even test","8.1.5","<code>MOD(N, 2) = 0</code> tests for even.")
+         : H.no("Correct even test","8.1.5","Test for even with <code>MOD(N, 2) = 0</code>."));
+       return pts;
+     }},
+    {type:"mcq", source:"exam-style", marks:1, ref:"8.1.5",
+     prompt:"A FOR loop runs 5 times and has an IF statement inside it. How many times is the IF <b>condition</b> checked in total?",
+     options:[
+       {t:"5 times — once on each pass of the loop", ok:true, why:"Correct. A nested statement runs once for every pass of the loop around it, so the IF is checked 5 times."},
+       {t:"Once", why:"The IF is inside the loop, so it runs each pass, not just once."},
+       {t:"10 times", why:"It runs once per pass: 5 passes → 5 checks."},
+       {t:"It depends on the ENDIF", why:"ENDIF just closes the IF; the loop around it decides it runs 5 times."}
+     ]}
+  ]
+};
+
 /* ============================================================
    GAME LAYER — XP, levels, streaks, badges, locks, celebrations.
    XP is worked out from saved progress (never stored), so it
@@ -2841,12 +4466,12 @@ function mergeProgress(other){
     for(const key of ["practise","first","low"]) Object.assign(p[key],q[key]);
     for(const key of ["att","tries"]) for(const [k,v] of Object.entries(q[key])) p[key][k]=Math.max(p[key][k]||0,v);
     for(const [k,r] of Object.entries(q.apply)) if(!p.apply[k] || r.got>p.apply[k].got) p.apply[k]=r;
+    // Best score wins for every question type (students may re-answer). Take the matching
+    // saved choice only when we take the saved score, so the shown answer matches the mark.
     for(const [k,v] of Object.entries(q.check)){
-      const question=SKILLS[id].check[k];
-      if(question.type==="mcq" || p.check[k]===undefined || v>p.check[k]) p.check[k]=v;
+      if(p.check[k]===undefined || v>p.check[k]){ p.check[k]=v; if(q.choices[k]!==undefined) p.choices[k]=q.choices[k]; }
     }
-    // A saved first choice wins over a later choice made in another tab.
-    Object.assign(p.choices,q.choices);
+    for(const [k,v] of Object.entries(q.choices)) if(p.choices[k]===undefined) p.choices[k]=v;
     for(const [k,v] of Object.entries(q.drafts)) if(p.drafts[k]===undefined) p.drafts[k]=v;
   });
   const G=g(), Q=other._game;
@@ -3209,15 +4834,18 @@ const H = {
     const a = info.assigns.find(x=>x.isLiteral && x.literal===val);
     if (!a) return H.no(title,"8.1.1",`We couldn't find ${val} stored in its own name. Add a line such as <code>${suggest} = ${val}</code> near the top.`);
     const n = H.assignCount(info,a.name);
-    if (!H.isUpper(a.name)) return H.no(title,"8.1.1",`You stored ${val} in <code>${esc(a.name)}</code>, which is a good start. In Python a constant's name is written in UPPER_CASE (e.g. <code>${suggest}</code>) so everyone can see it must not change.`);
-    if (n>1) return H.no(title,"8.1.1",`<code>${esc(a.name)}</code> is assigned ${n} times. A constant is set once and never changed while the program runs.`);
-    return H.yes(title,"8.1.1",`<code>${esc(a.name)} = ${val}</code> is set once, in UPPER_CASE.`);
+    // A value stored in a name that is set once and never changed IS being used as a constant,
+    // whatever the capitalisation. UPPER_CASE is the Python convention, mentioned as a tip, not required.
+    if (n>1) return H.no(title,"8.1.1",`<code>${esc(a.name)}</code> is given a value ${n} times, so it changes while the program runs — that makes it a variable, not a constant. Set the price once and don't change it afterwards.`);
+    return H.isUpper(a.name)
+      ? H.yes(title,"8.1.1",`<code>${esc(a.name)} = ${val}</code> is set once, in UPPER_CASE.`)
+      : H.yes(title,"8.1.1",`<code>${esc(a.name)} = ${val}</code> is set once and used as a constant. Tip: Python programmers write a constant's name in CAPITALS (<code>${suggest}</code>) so it's clear it should never change.`);
   },
   changePoint(info, run, oldV, newV, expect, title, okMsg){
     if (!run.error && H.numsInOrder(run, expect)) return H.yes(title,"8.1.1",okMsg);
     const magic = info.numLiterals.filter(l=>l.value===oldV && !l.bareAssign);
-    if (magic.length) return H.no(title,"8.1.1",`You typed ${oldV} again on line ${magic.map(m=>m.line).join(", ")}. Use the constant's name there instead, so the value only ever needs changing in one place.`);
-    return H.no(title,"8.1.1",`We changed ${oldV} to ${newV} but your output didn't change to ${expect.join(" and ")}. Make sure every calculation uses the constant.`);
+    if (magic.length) return H.no(title,"8.1.1",`One of your calculations types ${oldV} directly (line ${magic.map(m=>m.line).join(", ")}) instead of using the constant's name. Use the constant there too, e.g. <code>players * ${esc(info.assigns.find(x=>x.isLiteral&&x.literal===oldV)?.name||"SHIRT_PRICE")}</code>, so the price is only written once.`);
+    return H.no(title,"8.1.1",`When we changed the price to ${newV}, your totals didn't both update to ${expect.join(" and ")} (we saw ${H.numList(run)}). Check that <b>both</b> totals are worked out from the constant, and that the number of players is updated before the second total.`);
   },
   // Meaningful identifiers (8.1.8). opts.attempted gates the mark on a real attempt at THIS task,
   // and opts.roles ties each key value to names that actually describe it, so an off-task program
@@ -3225,7 +4853,7 @@ const H = {
   identPoint(info, opts){
     const title="Meaningful identifiers", ref="8.1.8";
     const attempted = opts ? !!opts.attempted : true;
-    if (!attempted) return H.no(title,ref,"This program doesn't attempt the task yet. Meaningful names are marked once your code actually stores and uses the task's values — write the program first.");
+    if (!attempted) return H.no(title,ref,"Write your program for this task first — then we'll check your names are clear.");
     const names=[...new Set(info.names)], issues=[];
     if (!names.length) return H.no(title,ref,"Your program doesn't store anything in variables yet, so there are no identifiers to check.");
     // General quality rules, applied to every name the program stores.
@@ -3238,16 +4866,16 @@ const H = {
     Object.values(lower).filter(v=>v.length>1).forEach(v=>issues.push(`${v.map(x=>`<code>${esc(x)}</code>`).join(" and ")} differ only in capital letters. Python treats them as different variables, which causes bugs.`));
     // Task relevance: each named role must describe what it holds.
     const roles=(opts&&opts.roles||[]).filter(r=>r.name);
-    if (!roles.length) return H.no(title,ref,`Store the task's values in clearly named variables${opts&&opts.hint?`, e.g. <code>${opts.hint}</code>`:""}. We couldn't find the task's values stored under meaningful names.`);
-    roles.forEach(r=>{ if(!r.ok.test(r.name)) issues.push(`<code>${esc(r.name)}</code> doesn't describe the ${r.label} it stores — use a name like <code>${r.examples}</code>.`); });
+    if (!roles.length) return H.no(title,ref,`Give the task's values clear names${opts&&opts.hint?`, like <code>${opts.hint}</code>`:""}, so anyone can tell what each one is for.`);
+    roles.forEach(r=>{ if(!r.ok.test(r.name)) issues.push(`<code>${esc(r.name)}</code> doesn't say it holds the ${r.label}. A name like <code>${r.examples}</code> is clearer.`); });
     return issues.length ? H.no(title,ref,issues.join("<br>"))
-                         : H.yes(title,ref,"Your names describe what they store and match the task. In the 15-mark question this is worth marks (AO3).");
+                         : H.yes(title,ref,"Clear, well-chosen names — anyone reading your code can tell what each value is for. This earns marks in the exam too.");
   },
   commentPoint(info, attempted){
     const title="Commented", ref="8.1.8";
-    if (attempted===false) return H.no(title,ref,"This program doesn't attempt the task yet. A comment is marked once your code attempts the task — write the program first.");
-    return info.comments>0 ? H.yes(title,ref,`${info.comments} comment${info.comments>1?"s":""} found. Comments are marked in their own right in the 15-mark question.`)
-      : H.no(title,ref,"Add at least one comment with <code>#</code> explaining what the program or a line does, e.g. <code># work out the total cost</code>.");
+    if (attempted===false) return H.no(title,ref,"Write your program first, then add a short comment explaining it.");
+    return info.comments>0 ? H.yes(title,ref,`${info.comments} comment${info.comments>1?"s":""} — a comment helps you and the examiner follow what your code does.`)
+      : H.no(title,ref,"Add a comment with <code>#</code> to explain what your program does, e.g. <code># work out the total cost</code>. Comments earn marks in the exam.");
   },
   // A genuine attempt = at least one of the task's substantive (non-quality) marks was earned.
   attempted(pts){ return pts.some(x=>x.ok); },
@@ -3408,7 +5036,7 @@ function feedbackHTML(a, src, out, p){
 
 /* ---------- checkpoint ---------- */
 function pcLines(text){
-  return text.split("\n").map(l=>l.replace(/[“”]/g,'"').replace(/[‘’ꞌ]/g,"'").replace(/<--?|←/g,"←").replace(/^\s*\d+[.:)]?\s+/,"").trim())
+  return text.split("\n").map(l=>l.replace(/[“”]/g,'"').replace(/[‘’ꞌ]/g,"'").replace(/<--?|←/g,"←").replace(/^\s*\d+[.)]\s+/,"").trim())
     .filter(l=>l && !l.startsWith("//")).map(s=>({s}));
 }
 function renderCheck(id, el){
@@ -3421,7 +5049,8 @@ function renderCheck(id, el){
     const record = sc=>{
       const b=snap(), wasDone=stageDone(id,"check"), prev=p.check[i];
       if (!Number.isInteger(sc) || sc<0 || sc>q.marks) return;
-      if (q.type==="mcq" && prev!==undefined) return;
+      // Students may re-answer any checkpoint question (it's formative); the best score is kept.
+      // Only the FIRST attempt affects the streak, so repeated guessing can't build one.
       if (prev===undefined && q.type!=="selfmark") streakHit(sc===q.marks);
       if (prev===undefined||sc>prev) p.check[i]=sc; save();
       $(`#ck${i} .tick`).textContent=`Scored ${p.check[i]}/${q.marks}`;
@@ -3452,22 +5081,19 @@ function ckValue(q, box, record){
 }
 function ckMcq(q, box, record, p, i){
   const buttons=()=>box.querySelectorAll(".opt");
+  // Buttons stay active: a student can change their answer until they get it right.
+  // record() keeps the best score, and only the first attempt touches the streak.
   qMcq(q, box, ok=>{
-    if(p.check[i]!==undefined) return;
     const selected=[...buttons()].find(b=>b.classList.contains(ok?"right":"wrong"));
-    p.choices[i]=Number(selected.dataset.j);
+    if(selected) p.choices[i]=Number(selected.dataset.j);
     record(ok?q.marks:0);
-    buttons().forEach(b=>b.disabled=true);
   });
-  if(p.check[i]!==undefined){
-    buttons().forEach(b=>b.disabled=true);
-    const choice=p.choices[i];
-    if(choice!==undefined){
-      const b=buttons()[choice], o=q.options[choice]; b.classList.add(o.ok?"right":"wrong");
-      $(".out",box).innerHTML=`<div class="fb ${o.ok?"ok":"no"}">${o.why}</div>`;
-    }
+  // On return, show the last choice and its feedback, but leave the options clickable.
+  if(p.check[i]!==undefined && p.choices[i]!==undefined){
+    const b=buttons()[p.choices[i]], o=q.options[p.choices[i]];
+    if(b){ b.classList.add(o.ok?"right":"wrong"); $(".out",box).innerHTML=`<div class="fb ${o.ok?"ok":"no"}">${o.ok?"🎉 ":"✗ Not quite. "}${o.why}</div>`; }
   }
-  box.insertAdjacentHTML("beforeend",`<p class="muted" style="font-size:.85rem">Your first choice is saved and scored, including after a refresh.</p>`);
+  box.insertAdjacentHTML("beforeend",`<p class="muted" style="font-size:.85rem">You can change your answer and try again until it's correct — your best score is kept.</p>`);
 }
 function ckSelf(q, box, record){
   box.innerHTML = `<textarea style="width:100%;min-height:120px" placeholder="Write your answer first, then reveal the mark scheme."></textarea>
