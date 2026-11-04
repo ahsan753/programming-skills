@@ -5431,11 +5431,13 @@ const CLOUD = (()=>{
   // Only the account this page loaded with may sync; a sign-in mid-page always reloads first.
   const live = () => !!session && session.uid===uid;
   const saveSession = () => { if (session) put(session.remember ? ls : ss, SESSION, JSON.stringify(session)); };
-  const dropSession = () => { del(ls, SESSION); del(ss, SESSION); };
+  // Remove the stored session for this account only (another account may be remembered in localStorage).
+  const dropSession = () => { for (const st of [ls, ss]){ let s = null; try { s = JSON.parse(get(st, SESSION)); } catch(e){} if (!s || s.uid===uid) del(st, SESSION); } };
 
   // off | loading | saving | saved | offline | expired
   let status = session ? "loading" : "off";
   let base = null, known = false, lastSaved = "", savedAt = null;
+  let extra = {};            // parts of the cloud copy this version of the page doesn't know (e.g. skills added later): kept, never dropped
   let timer = null, busy = false, again = false, retry = 0, hiddenAt = 0;
 
   /* ---------- network ---------- */
@@ -5452,15 +5454,18 @@ const CLOUD = (()=>{
     saveSession();
   }
   let refreshing = null;
-  function refresh(){
+  function refresh(force){
     if (!refreshing) refreshing = (async()=>{
-      // Another tab may already have rotated the refresh token.
+      // Another tab may already have rotated the refresh token: always continue from the newest one stored.
       const s = readSession();
-      if (s && s.uid===session.uid && s.expires_at > Date.now()+60000){ session = s; return true; }
+      if (s && s.uid===session.uid && s.refresh_token!==session.refresh_token){
+        session = {...session, access_token: s.access_token, refresh_token: s.refresh_token, expires_at: s.expires_at};
+        if (force || s.expires_at > Date.now()+60000) return true;
+      }
       const r = await auth("token?grant_type=refresh_token", {refresh_token: session.refresh_token});
       if (r.ok && r.data && r.data.access_token && r.data.user && r.data.user.id===session.uid){ adopt(r.data); return true; }
-      if (r.status>=400 && r.status<500){ expire(); return false; }
-      throw new Error("offline");
+      if (r.status===400 || r.status===401 || r.status===403){ expire(); return false; }   // sign-in revoked or used up
+      throw new Error("offline");                                                         // rate limit (429), server or network: retry later
     })().finally(()=>{ refreshing = null; });
     return refreshing;
   }
@@ -5468,7 +5473,7 @@ const CLOUD = (()=>{
     if (!session) throw new Error("signed out");
     if (Date.now() > session.expires_at - 60000 && !(await refresh())) throw new Error("signed out");
     const r = await fetch(`${CLOUD_URL}/rest/v1/${path}`, {...opts, headers: {apikey: CLOUD_KEY, Authorization: "Bearer " + session.access_token, "Content-Type": "application/json"}});
-    if (r.status===401 && !retried){ if (await refresh()) return rest(path, opts, true); throw new Error("signed out"); }
+    if (r.status===401 && !retried){ if (await refresh(true)) return rest(path, opts, true); throw new Error("signed out"); }
     if (!r.ok) throw new Error("http " + r.status);
     const t = await r.text(); return t ? JSON.parse(t) : null;
   }
@@ -5476,6 +5481,13 @@ const CLOUD = (()=>{
 
   /* ---------- sync ---------- */
   const mark = ok => put(ls, storeKey()+":synced", ok ? "1" : "0");
+  // Stable JSON (sorted keys): the same progress always gives the same text, whatever order the database returns.
+  function canon(v){
+    if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]";
+    if (v && typeof v==="object") return "{" + Object.keys(v).sort().filter(k => v[k]!==undefined).map(k => JSON.stringify(k) + ":" + canon(v[k])).join(",") + "}";
+    return JSON.stringify(v===undefined ? null : v);
+  }
+  const payload = () => canon(Object.assign({}, extra, PROG));
   async function pull(){
     // Filter by id: teacher logins can read every student's row, so never rely on "first row = mine".
     const rows = await rest(`progress?select=data,updated_at&user_id=eq.${session.uid}`);
@@ -5483,20 +5495,21 @@ const CLOUD = (()=>{
     const row = rows && rows[0];
     base = row ? row.updated_at : null;
     if (!row) return false;
-    lastSaved = JSON.stringify(row.data);
-    const before = JSON.stringify(PROG);
+    lastSaved = canon(row.data);
+    extra = {}; for (const [k,v] of Object.entries(row.data||{})) if (!Object.hasOwn(PROG, k)) extra[k] = v;
+    const before = canon(PROG);
     mergeProgress(cleanProgress(row.data));
-    return JSON.stringify(PROG) !== before;
+    return canon(PROG) !== before;
   }
   function merged(first){
-    saveLocal(); hud();
+    saveLocal(); mark(false); hud();
     const typing = document.activeElement && document.activeElement.matches("input,textarea,select");
     if (!typing && (first || !location.hash)) route();
   }
   async function push(){
     if (!known && await pull()) merged(false);
     for (let i=0; i<5; i++){
-      const snap = JSON.stringify(PROG);
+      const snap = payload();
       if (snap===lastSaved && base){ done(snap); return; }
       const v = await rest("rpc/save_progress", {method: "POST", body: `{"p_base":${JSON.stringify(base)},"p_data":${snap}}`});
       if (v){ base = v; done(snap); return; }
@@ -5506,7 +5519,7 @@ const CLOUD = (()=>{
   }
   function done(snap){
     lastSaved = snap; savedAt = new Date();
-    const clean = JSON.stringify(PROG)===snap;
+    const clean = payload()===snap;
     mark(clean); set(clean ? "saved" : "saving");
     if (!clean) schedule(1500);
   }
@@ -5523,8 +5536,9 @@ const CLOUD = (()=>{
     finally { busy = false; if (again){ again = false; schedule(0); } }
   }
   function queue(){
-    if (!live() || TEACHER) return;
-    mark(false);
+    if (TEACHER || !uid) return;
+    mark(false);              // also when signed out mid-page: this account's local copy now holds unsaved work, so never tidy it away
+    if (!live()) return;
     if (status!=="offline") set("saving");
     if (!timer || retry===0) schedule(2500);
   }
@@ -5532,12 +5546,14 @@ const CLOUD = (()=>{
     // Best effort while the page closes. If the cloud copy changed elsewhere the write is refused
     // and this browser's copy is merged in next time (nothing is lost).
     if (!live() || !known || Date.now() > session.expires_at - 30000) return;
-    const snap = JSON.stringify(PROG);
-    if (snap===lastSaved || snap.length > 60000) return;
+    const snap = payload();
+    if (snap===lastSaved) return;
+    const body = `{"p_base":${JSON.stringify(base)},"p_data":${snap}}`;
+    if (new Blob([body]).size > 60000) return;      // browsers cap keepalive bodies at 64 KB; the local copy is kept and saved next time
     try {
       fetch(`${CLOUD_URL}/rest/v1/rpc/save_progress`, {method: "POST", keepalive: true,
         headers: {apikey: CLOUD_KEY, Authorization: "Bearer " + session.access_token, "Content-Type": "application/json"},
-        body: `{"p_base":${JSON.stringify(base)},"p_data":${snap}}`});
+        body}).catch(()=>{});
     } catch(e){}
   }
 
@@ -5672,16 +5688,17 @@ const CLOUD = (()=>{
   async function signOut(){
     const key = storeKey();
     for (let i=0; busy && i<50; i++) await new Promise(r => setTimeout(r, 100));
-    if (live() && (JSON.stringify(PROG)!==lastSaved || timer)){
+    if (live() && (payload()!==lastSaved || timer)){
       clearTimeout(timer); timer = null;
       try { await push(); } catch(e){}
     }
-    const safe = JSON.stringify(PROG)===lastSaved;
+    const safe = payload()===lastSaved;
     if (!safe && !confirm("Your latest progress hasn't saved to your account yet. If you sign out now, it stays on this computer and is saved next time you sign in here. Sign out anyway?")) return;
     const token = session && session.access_token;
-    if (token) { try { await auth("logout", {}, token); } catch(e){} }
+    if (token) { try { await auth("logout?scope=local", {}, token); } catch(e){} }   // this device only, not their other computers
     if (safe){ del(ls, key); del(ls, key+":synced"); }
-    dropSession(); location.reload();
+    dropSession(); put(ls, "ps-signout", `${uid}:${Date.now()}`);                      // other open tabs of this account sign out too
+    location.reload();
   }
 
   async function start(){
@@ -5690,9 +5707,17 @@ const CLOUD = (()=>{
     if (!live()) return;
     if (get(ss, IMPORT)==="1"){
       del(ss, IMPORT);
-      try { mergeProgress(cleanProgress(JSON.parse(get(ls, STORE_BASE)))); saveLocal(); del(ls, STORE_BASE); } catch(e){}
+      try { mergeProgress(cleanProgress(JSON.parse(get(ls, STORE_BASE)))); saveLocal(); mark(false); del(ls, STORE_BASE); } catch(e){}
     }
     addEventListener("pagehide", flushOnLeave);
+    addEventListener("storage", e => {
+      if (!live()) return;
+      if (e.key==="ps-signout" && e.newValue && e.newValue.startsWith(uid+":")){ dropSession(); return location.reload(); }
+      if (e.key!==SESSION && e.key!==null) return;
+      const s = readSession();
+      if (!s || s.uid!==uid) return location.reload();          // signed out, or another account signed in, in another tab
+      if (s.refresh_token!==session.refresh_token) session = {...session, access_token: s.access_token, refresh_token: s.refresh_token, expires_at: s.expires_at};
+    });
     document.addEventListener("visibilitychange", () => {
       if (!live()) return;
       if (document.visibilityState==="hidden"){ hiddenAt = Date.now(); if (timer && !busy){ clearTimeout(timer); run(); } }
@@ -5725,7 +5750,7 @@ const count = (v,max=100000) => Number.isSafeInteger(v) && v>=0 ? Math.min(v,max
 function cleanProgress(raw){
   const data=object(raw), out={};
   liveSkills().forEach(id=>{
-    const old=object(data[id]), p={learn:old.learn===true,practise:{},apply:{},check:{},drafts:{},tries:{},first:{},att:{},low:{},choices:{}};
+    const old=object(data[id]), p={learn:old.learn===true,practise:{},apply:{},check:{},drafts:{},draftAt:{},tries:{},first:{},att:{},low:{},choices:{}};
     SKILLS[id].practise.forEach((q,i)=>{
       if (old.practise?.[i]===true) p.practise[i]=true;
       p.att[i]=count(object(old.att)[i]);
@@ -5735,7 +5760,10 @@ function cleanProgress(raw){
       const r=object(object(old.apply)[a.id]);
       if (Number.isInteger(r.got) && r.got>=0 && r.got<=a.marks && r.of===a.marks) p.apply[a.id]={got:r.got,of:a.marks};
       const draft=object(old.drafts)[a.id];
-      if (typeof draft==="string") p.drafts[a.id]=draft.slice(0,20000);
+      if (typeof draft==="string"){
+        p.drafts[a.id]=draft.slice(0,20000);
+        const at=object(old.draftAt)[a.id]; if (Number.isSafeInteger(at) && at>0) p.draftAt[a.id]=at;
+      }
       p.tries[a.id]=count(object(old.tries)[a.id]);
       if (object(old.low)[a.id]==="notyet") p.low[a.id]="notyet";
     });
@@ -5774,7 +5802,8 @@ function mergeProgress(other){
       if(p.check[k]===undefined || v>p.check[k]){ p.check[k]=v; if(q.choices[k]!==undefined) p.choices[k]=q.choices[k]; }
     }
     for(const [k,v] of Object.entries(q.choices)) if(p.choices[k]===undefined) p.choices[k]=v;
-    for(const [k,v] of Object.entries(q.drafts)) if(p.drafts[k]===undefined) p.drafts[k]=v;
+    // Code drafts: the most recently edited copy wins, so an old copy on another computer can't replace newer code.
+    for(const [k,v] of Object.entries(q.drafts)) if(p.drafts[k]===undefined || (q.draftAt[k]||0)>(p.draftAt[k]||0)){ p.drafts[k]=v; if(q.draftAt[k]) p.draftAt[k]=q.draftAt[k]; }
   });
   const G=g(), Q=other._game;
   G.best=Math.max(G.best,Q.best); G.comeback ||= Q.comeback; Object.assign(G.badges,Q.badges);
@@ -6339,7 +6368,7 @@ function renderApply(id, el){
 function wireApply(id, a){
   const root = $(`#ap-${a.id}`), ta = $("textarea",root), st = $(".status",root), p = P(id);
   ta.value = p.drafts[a.id] || "";
-  ta.addEventListener("input", ()=>{ p.drafts[a.id]=ta.value; save(); });
+  ta.addEventListener("input", ()=>{ p.drafts[a.id]=ta.value; p.draftAt[a.id]=Date.now(); save(); });
   ta.addEventListener("keydown", e=>{ if (e.key==="Tab"){ e.preventDefault(); const s=ta.selectionStart; ta.setRangeText("    ", s, ta.selectionEnd, "end"); } });
   const mdl = $(".mdl",root), box = $(".model",root);
   const showBest = ()=>{ const r=p.apply[a.id]; $(".best",root).innerHTML = r ? `Best: <b>${r.got}/${r.of}</b>${r.got===r.of?" ⭐":""}` : ""; };
