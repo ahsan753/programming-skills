@@ -5477,7 +5477,8 @@ const CLOUD = (()=>{
   /* ---------- sync ---------- */
   const mark = ok => put(ls, storeKey()+":synced", ok ? "1" : "0");
   async function pull(){
-    const rows = await rest("progress?select=data,updated_at");
+    // Filter by id: teacher logins can read every student's row, so never rely on "first row = mine".
+    const rows = await rest(`progress?select=data,updated_at&user_id=eq.${session.uid}`);
     known = true;
     const row = rows && rows[0];
     base = row ? row.updated_at : null;
