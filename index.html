@@ -417,7 +417,7 @@ code,pre,kbd,samp,textarea,input,.opt.code .ot,.fields input,table.trace input,.
 # Marking harness: runs inside Pyodide (Python in the browser).
 # analyse() inspects the pupil's code without running it; run() executes it
 # with scripted inputs and records everything that would appear on screen.
-import ast, io, sys, json, tokenize, traceback, builtins, copy
+import ast, io, sys, json, re, tokenize, traceback, builtins, copy
 
 class TooManyInputs(Exception):
     pass
@@ -430,24 +430,42 @@ class UnsupportedCode(Exception):
 
 # This pilot teaches variables and I/O. Pupil code must not import the
 # JavaScript bridge, inspect the harness, or mutate Python's shared builtins.
-SAFE_BUILTINS = {name: getattr(builtins, name) for name in (
-    "abs", "all", "any", "bool", "chr", "dict", "enumerate", "float", "int",
+_SAFE_NAMES = ("abs", "all", "any", "bool", "chr", "dict", "enumerate", "float", "int",
     "isinstance", "len", "list", "max", "min", "ord", "pow", "range", "repr",
     "reversed", "round", "set", "sorted", "str", "sum", "tuple", "zip",
-    "Exception", "ValueError", "TypeError", "ZeroDivisionError"
-)}
-SAFE_BUILTINS["print"] = print
+    "Exception", "ValueError", "TypeError", "ZeroDivisionError")
+def safe_builtins():
+    """A FRESH builtins dict for every run, so nothing a program does can carry over to the next run."""
+    d = {name: getattr(builtins, name) for name in _SAFE_NAMES}
+    d["print"] = print
+    return d
+
+# Introspection attributes that lead from an ordinary object to a stack frame, and from a frame to
+# the harness's own globals and the real builtins. None of them start with "_", so they are listed.
+_BAD_ATTR_PREFIXES = ("gi_", "cr_", "ag_", "f_", "tb_", "co_")
+_BAD_ATTRS = {"mro", "func_globals", "func_code", "format_map"}
+def _bad_attr(name):
+    return name.startswith("_") or name in _BAD_ATTRS or name.startswith(_BAD_ATTR_PREFIXES)
 
 def validate(tree):
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            raise UnsupportedCode("Imports are not available in this checker. Use input(), print() and built-in calculations for these tasks.")
-        if ((isinstance(node, ast.Attribute) and node.attr.startswith("_"))
+        # Only the random library may be imported (Skill 15). It is replaced by a scripted stand-in
+        # during marking, so nothing outside the sandbox is ever reached.
+        if isinstance(node, ast.Import) and any(a.name != "random" for a in node.names):
+            raise UnsupportedCode("Imports are not available in this checker, except the random library (import random). Use input(), print() and built-in calculations for these tasks.")
+        if isinstance(node, ast.ImportFrom) and (node.module != "random" or node.level):
+            raise UnsupportedCode("Imports are not available in this checker, except the random library (from random import randint). Use input(), print() and built-in calculations for these tasks.")
+        if isinstance(node, ast.ImportFrom) and any(a.name != "*" and a.name.startswith("_") for a in node.names):
+            raise UnsupportedCode("Python internals are not available in this checker.")
+        if ((isinstance(node, ast.Attribute) and _bad_attr(node.attr))
                 or (isinstance(node, ast.Name) and node.id.startswith("__"))):
             raise UnsupportedCode("Python internals are not available in this checker.")
         # A dunder hidden inside a string literal (e.g. "{0.__globals__}".format(x)) is not an
         # Attribute node, so it slips past the check above. Reject any string that names one.
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) and "__" in node.value:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and (
+                "__" in node.value
+                # str.format attribute access such as "{0.gi_frame}" or "{0._f}"
+                or re.search(r"\{[^{}]*\.[A-Za-z_]", node.value)):
             raise UnsupportedCode("Python internals are not available in this checker.")
 
 def literal_value(node):
@@ -473,6 +491,7 @@ def analyse(src):
     info = {"assigns": [], "inputs": [], "comments": 0, "names": [],
             "numLiterals": [], "strLiterals": [], "calls": [], "ops": [],
             "constructs": [], "hasElse": False, "hasElif": False,
+            "imports": [], "methods": [], "loopRefs": [],
             "nested": False, "nestedLoop": False, "ifInLoop": False, "loopVars": [], "lines": len(src.splitlines())}
     try:
         for tok in tokenize.generate_tokens(io.StringIO(src).readline):
@@ -506,6 +525,12 @@ def analyse(src):
                 info["assigns"].append(rec)
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
             info["names"].append(node.id)
+        if isinstance(node, ast.Import):
+            info["imports"] += [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            info["imports"].append(node.module)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            info["methods"].append(node.func.attr)          # e.g. upper, lower, randint
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             info["calls"].append(node.func.id)
             if node.func.id == "input":
@@ -549,10 +574,15 @@ def analyse(src):
                     info["hasElse"] = True
         elif isinstance(node, ast.For):
             info["constructs"].append("for")
+            # names the loop works over, e.g. email in "for i in range(len(email))" or "for c in email"
+            info["loopRefs"] += [n.id for n in ast.walk(node.iter) if isinstance(n, ast.Name)]
             if isinstance(node.target, ast.Name):
                 info["loopVars"].append(node.target.id)
         elif isinstance(node, ast.While):
             info["constructs"].append("while")
+            info["loopRefs"] += [n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)]
+            info["loopRefs"] += [n.value.id for s in node.body for n in ast.walk(s)
+                                 if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name)]
         elif hasattr(ast, "Match") and isinstance(node, ast.Match):
             # Python 3.10+ match/case: a multi-way selection (the Python cousin of CASE)
             info["constructs"].append("match")
@@ -634,7 +664,66 @@ class Override(ast.NodeTransformer):
                 pass
         return node
 
-def run(tree, info, inputs, overrides):
+class ScriptedRandom:
+    """Stand-in for the random module while marking. It hands out scripted fractions (0 <= f < 1), so a
+    test can force the LOWEST possible value (f = 0) or the HIGHEST (f = 0.999999) and check the range."""
+    def __init__(self, fracs):
+        self._f = [float(x) for x in fracs] if fracs else [0.42, 0.17, 0.93, 0.58, 0.05, 0.76]
+        self._i = 0
+    def _next(self):
+        v = self._f[self._i % len(self._f)]
+        self._i += 1
+        return v
+    def random(self):
+        return self._next()
+    def randint(self, a, b):
+        if not (isinstance(a, int) and isinstance(b, int)) or isinstance(a, bool) or isinstance(b, bool):
+            raise ValueError("randint() needs two whole numbers, e.g. randint(1, 6)")
+        if b < a:
+            raise ValueError("empty range in randint(%d, %d)" % (a, b))
+        return min(b, a + int(self._next() * (b - a + 1)))
+    def randrange(self, start, stop=None, step=1):
+        if stop is None:
+            start, stop = 0, start
+        r = range(start, stop, step)
+        if len(r) == 0:
+            raise ValueError("empty range in randrange()")
+        return r[min(len(r) - 1, int(self._next() * len(r)))]
+    def uniform(self, a, b):
+        return a + (b - a) * self._next()
+    def choice(self, seq):
+        seq = list(seq)
+        if not seq:
+            raise IndexError("cannot choose from an empty sequence")
+        return seq[min(len(seq) - 1, int(self._next() * len(seq)))]
+    def choices(self, seq, weights=None, k=1):
+        return [self.choice(seq) for _ in range(k)]
+    def sample(self, seq, k):
+        pool = list(seq)
+        if k > len(pool):
+            raise ValueError("sample larger than population")
+        out = []
+        for _ in range(k):
+            out.append(pool.pop(min(len(pool) - 1, int(self._next() * len(pool)))))
+        return out
+    def shuffle(self, x):
+        for i in range(len(x) - 1, 0, -1):          # scripted Fisher-Yates
+            j = min(i, int(self._next() * (i + 1)))
+            x[i], x[j] = x[j], x[i]
+    def seed(self, *a, **k):
+        pass
+
+_RANDOM_PUBLIC = ("random", "randint", "randrange", "uniform", "choice", "choices", "sample", "shuffle", "seed")
+class RandomModule:
+    """What 'import random' gives a pupil: only the public routines (bound to a hidden ScriptedRandom),
+    so the scripted values can't be read or changed, and 'from random import *' works."""
+    def __init__(self, src):
+        for n in _RANDOM_PUBLIC:
+            setattr(self, n, getattr(src, n))
+    def __getattr__(self, name):
+        raise AttributeError("The checker's random library supports: " + ", ".join(_RANDOM_PUBLIC))
+
+def run(tree, info, inputs, overrides, rand=None):
     t = copy.deepcopy(tree)
     if overrides:
         counts = {}
@@ -662,8 +751,14 @@ def run(tree, info, inputs, overrides):
             return len(s)
         def flush(self):
             pass
-    safe = dict(SAFE_BUILTINS)
+    safe = safe_builtins()
     safe["input"] = fake_input
+    rnd = RandomModule(ScriptedRandom(rand))
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "random":
+            return rnd
+        raise ImportError("Only the random library can be imported here.")
+    safe["__import__"] = fake_import
     g = {"__name__": "__main__", "__builtins__": safe}
     old = sys.stdout
     sys.stdout = Screen()
@@ -694,7 +789,7 @@ def check(src, tests_json):
                                       "line": e.lineno, "text": (e.text or "").rstrip()}})
     except UnsupportedCode as e:
         return json.dumps({"unsupported": str(e)})
-    runs = [run(tree, info, t.get("inputs", []), t.get("overrides")) for t in tests]
+    runs = [run(tree, info, t.get("inputs", []), t.get("overrides"), t.get("rand")) for t in tests]
     return json.dumps({"info": info, "runs": runs}, default=str)
 
 </script>
@@ -718,7 +813,7 @@ const SKILL_MAP = [
     [10,"Count-controlled loops (FOR)","8.1.4(c)","s10"],[11,"Pre-condition loops (WHILE)","8.1.4(c)","s11"],
     [12,"Post-condition loops (REPEAT)","8.1.4(c)","s12"],[13,"Nested statements","8.1.5","s13"]]},
   {g:"C", title:"Strings and library routines", ref:"8.1.4(e), 8.1.7", items:[
-    [14,"String handling","8.1.4(e)"],[15,"Library routines","8.1.7"]]},
+    [14,"String handling","8.1.4(e)","s14"],[15,"Library routines","8.1.7","s15"]]},
   {g:"D", title:"Subroutines", ref:"8.1.6, 8.1.8", items:[
     [16,"Procedures","8.1.6"],[17,"Functions","8.1.6"],[18,"Local and global variables","8.1.6(c)"],
     [19,"Maintainable programs","8.1.8"]]},
@@ -2045,7 +2140,7 @@ print((10 + 20) / 2)    # 15.0  — brackets force the addition first`,
 Minutes ← MOD(Total, 60)
 IsLeap  ← MOD(Year, 4) = 0`,
      after:`<div class="exam"><h3>Examiner reports</h3>
-       <blockquote>“Most candidates were able to identify the correct purpose of MOD and DIV, with only a few giving the correct pseudocode.”<cite>June 2025 Paper 21 Q5</cite></blockquote>
+       <blockquote>“Most candidates were able to identify the correct purpose of MOD and DIV with only a few giving the correct pseudocode for MOD and DIV.”<cite>June 2025 Paper 21 Q5</cite></blockquote>
        <blockquote>“A few candidates used DIV instead of MOD to find the leap year.”<cite>June 2026 Paper 21 Q12</cite></blockquote>
        <p>MOD and DIV are examinable both as <b>arithmetic operators</b> (8.1.4f) and as <b>library routines</b> (8.1.7), so they are not answers to “which are <i>not</i> arithmetic operators”.</p></div>`}
   ],
@@ -4365,17 +4460,7 @@ for r in range(rows):
     line = ""
     for c in range(cols):
         line = line + "*"
-    print(line)`,
-       pc:`// Star rectangle
-INPUT Rows
-INPUT Cols
-FOR R ← 1 TO Rows
-    Line ← ""
-    FOR C ← 1 TO Cols
-        Line ← Line & "*"
-    NEXT C
-    OUTPUT Line
-NEXT R`},
+    print(line)`},
           mark(R){
        const {info,H}=R, pts=[], [r0,r1]=R.runs, c=info.constructs||[];
        // only lines that contain stars count as rows, so prompts, headings and "Done!" don't matter
@@ -4456,6 +4541,671 @@ NEXT N`,
   ]
 };
 
+/* ------------------------------------------------------------
+   SKILL 14 — STRING HANDLING (8.1.4e)
+   ------------------------------------------------------------ */
+SKILLS.s14 = {
+  n:14, title:"String handling", ref:"8.1.4(e)",
+  intro:"Work with text: find its length, pull out part of it, and change its case. In the exam the ideas are easy — the marks go on writing LENGTH, SUBSTRING, UCASE and LCASE exactly right.",
+  learn:[
+    {h:"A string is a row of characters", html:`
+      <p>A <b>string</b> is a sequence of characters, and every character has a <b>position</b>. The <b>length</b> is how many characters there are — spaces and punctuation count too.</p>
+      <p>Cambridge pseudocode usually numbers positions from <b>1</b>. Python numbers them from <b>0</b>. (The syllabus allows either, but be consistent.)</p>
+      <div class="tablewrap"><table class="grid">
+        <tr><th>Character</th><td>H</td><td>a</td><td>p</td><td>p</td><td>y</td><td>␣</td><td>D</td><td>a</td><td>y</td><td>s</td></tr>
+        <tr><th>Pseudocode position</th><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td><td>6</td><td>7</td><td>8</td><td>9</td><td>10</td></tr>
+        <tr><th>Python index</th><td>0</td><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td><td>6</td><td>7</td><td>8</td><td>9</td></tr>
+      </table></div>`,
+     py:`phrase = "Happy Days"
+print(len(phrase))      # 10`,
+     pc:`Phrase ← "Happy Days"
+OUTPUT LENGTH(Phrase)   // 10`,
+     after:`<div class="note">The space counts as a character, so <code>"Happy Days"</code> has length 10, not 9.</div>`},
+
+    {h:"Upper and lower case", html:`
+      <p><code>UCASE</code> gives a copy of a string in CAPITALS, and <code>LCASE</code> gives it in lower case. In Python these are <code>.upper()</code> and <code>.lower()</code>.</p>
+      <p>A handy use: comparing what a user typed without worrying about capitals — <code>if answer.lower() == "yes":</code> accepts Yes, YES and yes.</p>`,
+     py:`team = "Falcons"
+loud = team.upper()      # "FALCONS"
+quiet = team.lower()     # "falcons"`,
+     pc:`Team ← "Falcons"
+Loud ← UCASE(Team)       // "FALCONS"
+Quiet ← LCASE(Team)      // "falcons"`,
+     after:`<div class="note tip"><b>Keep the result.</b> <code>team.upper()</code> on its own line changes nothing — the original string is left as it was. Store the result in a variable (or use it straight away in an output or a comparison).</div>`},
+
+    {h:"Taking part of a string: SUBSTRING", html:`
+      <p><code>SUBSTRING(&lt;string&gt;, &lt;start&gt;, &lt;length&gt;)</code> returns <b>length</b> characters, beginning at position <b>start</b>. So <code>SUBSTRING("Happy Days", 1, 5)</code> is <code>"Happy"</code>.</p>
+      <p>Python uses a <b>slice</b> instead: <code>text[from:to]</code> takes the characters from index <code>from</code> up to, but <b>not including</b>, index <code>to</code>.</p>
+      <div class="tablewrap"><table class="grid">
+        <tr><th>Pseudocode</th><th>Python</th><th>Result</th></tr>
+        <tr><td><code>SUBSTRING(Phrase, 1, 5)</code></td><td><code>phrase[0:5]</code></td><td><code>Happy</code></td></tr>
+        <tr><td><code>SUBSTRING(Phrase, 7, 4)</code></td><td><code>phrase[6:10]</code></td><td><code>Days</code></td></tr>
+        <tr><td><code>SUBSTRING(Phrase, 2, 1)</code></td><td><code>phrase[1]</code></td><td><code>a</code></td></tr>
+      </table></div>`,
+     after:`<div class="note">To turn <code>SUBSTRING(S, start, length)</code> into Python: the slice starts at <code>start - 1</code> and stops at <code>start - 1 + length</code>. A slice never goes past the end of a string, so <code>"Jo"[0:3]</code> is just <code>"Jo"</code>.</div>`},
+
+    {h:"Looking at every character", html:`
+      <p>Put string handling inside a loop to check each character in turn — for example, counting how many times a letter appears.</p>`,
+     py:`word = "banana"
+count = 0
+for i in range(len(word)):
+    if word[i] == "n":
+        count = count + 1
+print(count)             # 2`,
+     pc:`Word ← "banana"
+Count ← 0
+FOR Index ← 1 TO LENGTH(Word)
+    IF SUBSTRING(Word, Index, 1) = "n" THEN
+        Count ← Count + 1
+    ENDIF
+NEXT Index
+OUTPUT Count`,
+     after:`<div class="note tip">In pseudocode the loop runs from 1 to <code>LENGTH(Word)</code> and takes one character with <code>SUBSTRING(Word, Index, 1)</code>. In Python, <code>range(len(word))</code> gives indexes 0 to 5 for a 6-letter word.</div>`},
+
+    {h:"Worked example: initials", html:`
+      <p>A sign-in screen shows a user's initials in capitals: the first letter of their first name and the first letter of their last name.</p>`,
+     py:`# Initials
+first = input("First name: ")
+last = input("Last name: ")
+initials = (first[0:1] + last[0:1]).upper()
+print("Initials:", initials)     # sara, khan -> SK`,
+     pc:`// Initials
+INPUT First
+INPUT Last
+FirstInitial ← UCASE(SUBSTRING(First, 1, 1))
+LastInitial ← UCASE(SUBSTRING(Last, 1, 1))
+OUTPUT "Initials: ", FirstInitial, LastInitial`,
+     after:`<div class="exam"><h3>What the examiners say</h3>
+        <blockquote>“Most candidates were able to store the phrase correctly and use the length function correctly but only a few were able to use the correct pseudocode uppercase function. Many candidates used code for the uppercase function.”<cite>June 2023 Paper 21 Q8(a)</cite></blockquote>
+        <blockquote>“Some candidates incorrectly used UCASE and SUBSTRING functions by not assigning the result to a variable.”<cite>June 2026 Paper 21 Q5(b)</cite></blockquote>
+        <p>In a <b>pseudocode</b> answer write <code>LENGTH</code>, <code>SUBSTRING</code>, <code>UCASE</code> and <code>LCASE</code> — never <code>len()</code>, slices or <code>.upper()</code>. And always store or use the result.</p></div>`}
+  ],
+
+  practise:[
+    {type:"value", title:"Length and capitals", ref:"8.1.4e",
+     prompt:"What does each line print? Type exactly what appears, capitals included.",
+     lang:"py", code:`phrase = "Happy Days"
+print(len(phrase))
+print(phrase.upper())`,
+     fields:[{label:"Line 1",a:["10"]},{label:"Line 2",a:["HAPPY DAYS"],exact:true}],
+     why:"The space counts, so the length is <b>10</b>. <code>.upper()</code> gives <b>HAPPY DAYS</b>."},
+    {type:"value", title:"SUBSTRING and LENGTH", ref:"8.1.4e",
+     prompt:"Give the value of each pseudocode expression. Type the characters only, without quotation marks.<br>1. <code>SUBSTRING(\"Happy Days\", 7, 4)</code><br>2. <code>LENGTH(\"Hi there\")</code>",
+     fields:[{label:"SUBSTRING(\"Happy Days\", 7, 4)",a:["Days"],exact:true},{label:"LENGTH(\"Hi there\")",a:["8"]}],
+     why:"Position 7 is the D, and 4 characters from there is <b>Days</b>. \"Hi there\" has 8 characters, including the space."},
+    {type:"mcq", title:"Pseudocode to Python", ref:"8.1.4e",
+     prompt:"Which Python expression gives the same result as <code>SUBSTRING(Name, 2, 3)</code>?",
+     options:[
+       {t:"name[1:4]", code:true, ok:true, why:"Correct. Pseudocode position 2 is Python index 1, and 3 characters from there stops before index 4."},
+       {t:"name[2:5]", code:true, why:"Python counts from 0, so pseudocode position 2 is index 1, not 2."},
+       {t:"name[1:3]", code:true, why:"That gives only 2 characters (indexes 1 and 2). The stop index is not included, so you need 1:4 for 3 characters."},
+       {t:"name[2:3]", code:true, why:"That's one character from index 2. You want 3 characters starting at index 1."}
+     ]},
+    {type:"mcq", title:"Keep the result", ref:"8.1.4e",
+     prompt:"What does this program print?",
+     lang:"py", code:`name = "sam"
+name.upper()
+print(name)`,
+     options:[
+       {t:"sam", ok:true, why:"Correct. <code>.upper()</code> makes a NEW string, but line 2 doesn't store it anywhere, so name is still \"sam\". Write <code>name = name.upper()</code>."},
+       {t:"SAM", why:"Line 2 makes \"SAM\" but throws it away. Without <code>name = name.upper()</code>, name never changes."},
+       {t:"Sam", why:"<code>.upper()</code> would give all capitals, and here the result isn't even kept."},
+       {t:"An error", why:"The code is valid — it just doesn't keep the upper-case version."}
+     ]},
+    {type:"classify", title:"Pseudocode or Python?", ref:"8.1.4e",
+     prompt:"Examiners take marks off for Python in a pseudocode answer. Decide which language each piece is written in.",
+     options:["Pseudocode","Python"],
+     items:[
+       {t:"LENGTH(Name)", code:true, a:"Pseudocode", why:"LENGTH(...) is the pseudocode routine."},
+       {t:"len(name)", code:true, a:"Python", why:"len() is Python."},
+       {t:"UCASE(Name)", code:true, a:"Pseudocode", why:"UCASE(...) is the pseudocode routine."},
+       {t:"name.lower()", code:true, a:"Python", why:".lower() is a Python method."},
+       {t:"SUBSTRING(Name, 1, 2)", code:true, a:"Pseudocode", why:"SUBSTRING(string, start, length) is pseudocode."},
+       {t:"name[0:2]", code:true, a:"Python", why:"A slice is Python."}
+     ]},
+    {type:"value", title:"Loop through a string", ref:"8.1.4e / 8.1.4c",
+     prompt:"What does this print?",
+     lang:"py", code:`word = "banana"
+count = 0
+for letter in word:
+    if letter == "a":
+        count = count + 1
+print(count)`,
+     fields:[{label:"Output",a:["3"]}],
+     why:"The loop looks at b, a, n, a, n, a — three of them are \"a\", so it prints <b>3</b>."}
+  ],
+
+  apply:[
+    {id:"a1", marks:6, title:"Gamer tag", context:"Gaming",
+     brief:`<p>A game makes a player's tag from their name: the <b>first three letters in capitals</b>, followed by the <b>number of letters in the name</b>.</p>
+      <p>For example <code>salma</code> → <code>SAL5</code>, and <code>Alexander</code> → <code>ALE9</code>. A short name such as <code>Jo</code> → <code>JO2</code>.</p>
+      <ul><li>ask for the player's name</li>
+      <li>output a message containing the tag, with no space inside it (e.g. <code>Your tag is SAL5</code>)</li>
+      <li>use clear names and at least one comment.</li></ul>
+      <p>Join text with <code>+</code>; a number needs <code>str()</code> before it can be joined.</p>`,
+     example:[["out","Your name: "],["in","salma"],["out","Your tag is SAL5"]],
+          tests:[
+       {label:"salma", kind:"normal", inputs:["salma"], expect:"Your tag is SAL5"},
+       {label:"Jo (shorter than 3 letters)", kind:"normal", inputs:["Jo"], expect:"Your tag is JO2"},
+       {label:"Alexander", kind:"normal", inputs:["Alexander"], expect:"Your tag is ALE9"},
+       {label:"A name you haven't seen", kind:"normal", inputs:["Muhammad"], expect:"Your tag is MUH8"}
+     ],
+     hints:[
+       "The first three letters are <code>name[0:3]</code> — a slice never goes past the end, so it works for Jo too.",
+       "Capitals: <code>.upper()</code>. The number of letters: <code>len(name)</code>.",
+       "Build the tag with <code>+</code>: <code>tag = name[0:3].upper() + str(len(name))</code>."
+     ],
+     model:{py:`# Gamer tag: first three letters in capitals + length of name
+name = input("Your name: ")
+tag = name[0:3].upper() + str(len(name))
+print("Your tag is " + tag)`,
+       pc:`// Gamer tag
+INPUT Name
+Letters ← UCASE(SUBSTRING(Name, 1, 3))
+OUTPUT "Your tag is ", Letters, LENGTH(Name)`},
+          mark(R){
+       const {info,H}=R, pts=[], runs=R.runs;
+       const own=i=>runs[i].error?"":H.ownText(runs,i);
+       // everything printed after the name was typed (a tag printed in a loop shows up several times here)
+       const after=r=>{ let k=-1; r.events.forEach((e,j)=>{ if(e[0]==="in") k=j; }); return r.events.slice(k+1).filter(e=>e[0]==="out").map(e=>e[1]).join(""); };
+       const TAGS=["SAL5","JO2","ALE9","MUH8"];
+       const once=TAGS.every((t,i)=>!runs[i].error&&after(runs[i]).split(t).length-1<=1);
+       pts.push(info.inputs.length>=1? H.yes("Reads the player's name","8.1.3","An input reads the name.")
+         : H.no("Reads the player's name","8.1.3","Read the name with <code>input(...)</code>."));
+       // exactly three capitals: SAL followed by something that isn't another capital (SALMA5 doesn't count)
+       const three=(i,s)=>new RegExp("\\b"+s+"(?![A-Z])").test(own(i));
+       const capsOk=three(0,"SAL")&&three(2,"ALE")&&three(3,"MUH");
+       pts.push(capsOk? H.yes("First three letters in capitals","8.1.4e","salma → SAL, Alexander → ALE, Muhammad → MUH.")
+         : H.no("First three letters in capitals","8.1.4e", runs[0].error?"The program stopped with an error — see above."
+             : own(0).includes("SALMA")?"Use only the first three letters, with a slice: <code>name[0:3]</code>."
+             : /sal/.test(own(0))?"Convert the letters to capitals with <code>.upper()</code> — and keep the result, e.g. <code>name[0:3].upper()</code>."
+             : "Take the first three letters with a slice, <code>name[0:3]</code>, and make them capitals with <code>.upper()</code>."));
+       const tagOk=own(0).includes("SAL5")&&own(2).includes("ALE9")&&own(3).includes("MUH8");
+       pts.push(tagOk&&once? H.yes("Adds the length to make the tag","8.1.4e","SAL5, ALE9 and MUH8 — letters and length joined, printed once.")
+         : H.no("Adds the length to make the tag","8.1.4e", runs[0].error?"The program stopped with an error — see above."
+             : tagOk?"Print the tag once, not several times."
+             : own(0).includes("SALMA")?"Use only the first three letters, <code>name[0:3]</code>, not the whole name."
+             : /SAL\s+5/.test(own(0))?"Join the letters and the number with <code>+</code> (and <code>str()</code>), not a comma — a comma puts a space in: <code>SAL 5</code>."
+             : own(0).includes("SAL5")?"That works for the example names, but not for a name it hasn't seen (Muhammad should give MUH8). Work the tag out from the name with a slice, <code>.upper()</code> and <code>len()</code>."
+             : capsOk?"Add the number of letters after them: <code>str(len(name))</code>."
+             : "For salma the tag should be SAL5: three capital letters, then the length."));
+       const shortOk=capsOk&&own(1).includes("JO2");
+       pts.push(shortOk? H.yes("Works for a short name (Jo → JO2)","8.1.4e","A slice stops at the end of the name, so a 2-letter name works.")
+         : H.no("Works for a short name (Jo → JO2)","8.1.4e", runs[1].error&&runs[1].error.type==="IndexError"?"<code>name[2]</code> doesn't exist for a 2-letter name. Use a slice, <code>name[0:3]</code>, which never goes past the end."
+             : runs[1].error?"The program stopped with an error for Jo — see above."
+             : !capsOk?"First get the three-capital-letter part right (see above)."
+             : "For Jo the tag should be JO2."));
+       const attempted=H.attempted(pts.slice(1));
+       pts.push(H.identPoint(info,{attempted, hint:"name, tag", roles:[
+         {name:(info.inputs[0]||{}).var||null, ok:/name|player|user|gamer|first/i, label:"player's name", examples:"name"}]}));
+       pts.push(H.commentPoint(info, attempted));
+       return pts;
+     }},
+
+    {id:"a2", marks:5, title:"Check for an @", context:"Social media",
+     brief:`<p>A sign-up form needs an email address that contains an <code>@</code>. Write a Python program that:</p>
+      <ul><li>asks for an email address</li>
+      <li>uses a <b>loop</b> to look at every character, one at a time</li>
+      <li>after the loop, outputs <code>Valid</code> if an <code>@</code> was found anywhere, or <code>Invalid</code> if not — <b>once</b>, not once per character.</li></ul>
+      <p>Tip: use a flag. Set <code>found = False</code> before the loop and change it to <code>True</code> when you see an <code>@</code>.</p>`,
+     example:[["out","Email: "],["in","sam@school.qa"],["out","Valid"]],
+          tests:[
+       {label:"Contains @", kind:"normal", inputs:["sam@school.qa"], expect:"Valid"},
+       {label:"No @", kind:"abnormal", inputs:["samschool.qa"], expect:"Invalid"},
+       {label:"@ is the first character", kind:"normal", inputs:["@home"], expect:"Valid"},
+       {label:"@ is the last character", kind:"normal", inputs:["user@"], expect:"Valid"}
+     ],
+     hints:[
+       "Loop over every position: <code>for i in range(len(email)):</code> and look at <code>email[i]</code>.",
+       "If <code>email[i] == \"@\"</code>, set <code>found = True</code>.",
+       "Print the result after the loop (not indented), so it appears once."
+     ],
+     model:{py:`# Check an email address contains @
+email = input("Email: ")
+found = False
+for i in range(len(email)):
+    if email[i] == "@":
+        found = True
+if found:
+    print("Valid")
+else:
+    print("Invalid")`,
+       pc:`// Check an email address contains @
+INPUT Email
+Found ← FALSE
+FOR Index ← 1 TO LENGTH(Email)
+    IF SUBSTRING(Email, Index, 1) = "@" THEN
+        Found ← TRUE
+    ENDIF
+NEXT Index
+IF Found = TRUE THEN
+    OUTPUT "Valid"
+ELSE
+    OUTPUT "Invalid"
+ENDIF`},
+          mark(R){
+       const {info,H}=R, pts=[], runs=R.runs;
+       const V=/\bvalid\b/i, I=/\binvalid\b/i;
+       // only what was printed after the email was typed (headings and prompts before it don't count)
+       const after=r=>{ let k=-1; r.events.forEach((e,j)=>{ if(e[0]==="in") k=j; }); return r.events.slice(k+1).filter(e=>e[0]==="out").map(e=>e[1]).join(""); };
+       const own=i=>runs[i].error?"":after(runs[i]);
+       const says=(i,re,not)=>re.test(own(i))&&!not.test(own(i));
+       const both=i=>V.test(own(i))&&I.test(own(i));
+       pts.push(info.inputs.length>=1? H.yes("Reads the email address","8.1.3","An input reads the email.")
+         : H.no("Reads the email address","8.1.3","Read the email with <code>input(...)</code>."));
+       const v=(info.inputs[0]||{}).var;
+       const loopsOverEmail=!!v&&(info.loopRefs||[]).includes(v);
+       pts.push(loopsOverEmail? H.yes("Uses a loop to look at each character","8.1.4e / 8.1.4c","A loop works through the email one character at a time.")
+         : H.no("Uses a loop to look at each character","8.1.4e / 8.1.4c","This task practises string handling in a loop: loop over the email's characters, e.g. <code>for i in range(len(email)):</code>."));
+       const mid=says(0,V,I), edges=says(2,V,I)&&says(3,V,I);
+       pts.push(mid&&edges? H.yes("Accepts an email that contains @","8.1.4e","Found anywhere — including the very first and very last character.")
+         : H.no("Accepts an email that contains @","8.1.4e", runs[0].error?"The program stopped with an error — see above."
+             : both(0)?"Your program printed both Valid and Invalid. Only one should appear: decide after the loop with <code>if ... else</code>."
+             : !mid?"sam@school.qa contains an @, so it should output <code>Valid</code>."
+             : "An @ as the very first or very last character should still count. Check your loop visits every position: <code>range(len(email))</code>."));
+       pts.push(says(1,I,V)? H.yes("Rejects an email with no @","8.1.4e","samschool.qa → Invalid.")
+         : H.no("Rejects an email with no @","8.1.4e", runs[1].error?"The program stopped with an error — see above."
+             : both(1)?"Your program printed both Valid and Invalid. Only one should appear."
+             : "samschool.qa has no @, so it should output <code>Invalid</code> (and not Valid)."));
+       const results=r=>after(r).split("\n").filter(l=>/\b(in)?valid\b/i.test(l)).length;
+       const once=runs.every(r=>!r.error&&results(r)===1);
+       pts.push(once? H.yes("Prints one result, after the loop","8.1.4e","Each email gets exactly one Valid or Invalid.")
+         : H.no("Prints one result, after the loop","8.1.4e", runs.some(r=>!r.error&&results(r)>1)?"Your program prints a result more than once. Use a flag inside the loop, then print <b>once</b>, after the loop."
+             : "Print <code>Valid</code> or <code>Invalid</code> once for every email."));
+       return pts;
+     }}
+  ],
+
+  check:[
+    {type:"pseudo", source:"June 2026 Paper 21 Q5(b)", marks:3, ref:"8.1.4e",
+     prompt:"A system makes usernames for new users. The last name is input into the variable <code>LastName</code>.<br>Write the pseudocode to:<ul><li>take the first two letters from <code>LastName</code></li><li>convert the letters to upper case</li><li>store the result in the variable <code>Temp</code></li></ul>",
+     placeholder:"Temp ← ...",
+     model:`Temp ← UCASE(SUBSTRING(LastName, 1, 2))`,
+          mark(L,H){
+       const pts=[], text=L.map(l=>l.s).join("\n");
+       const py=/\.upper\s*\(|\.lower\s*\(|\[\s*\d*\s*:\s*\d*\s*\]|\blen\s*\(/i.test(text);
+       // What does Temp finally hold? Follow every Temp ← line in order (Temp ← UCASE(Temp) builds on the line before).
+       let val="";
+       L.forEach(l=>{ const m=l.s.match(/^Temp\s*←\s*(.+)$/i); if(m) val=m[1].replace(/\bTemp\b/gi, val||"Temp"); });
+       const flat=val.replace(/\s+/g,"").toUpperCase();
+       const ucOk=/UCASE\(/.test(flat)&&!/^LCASE\(/.test(flat);
+       const subOk=/SUBSTRING\((LASTNAME|UCASE\(LASTNAME\)),[01],2\)/.test(flat);
+       const anyUC=/\bUCASE\s*\(/i.test(text), anySub=/SUBSTRING\s*\(/i.test(text);
+       pts.push(ucOk? H.yes("Correct use of UCASE","8.1.4e","Temp ends up holding the upper-case letters.")
+         : H.no("Correct use of UCASE","8.1.4e", anyUC?"You used UCASE, but its result isn't stored in Temp. Assign it: <code>Temp ← UCASE(...)</code> — examiners took marks off when the result wasn't assigned to a variable."
+             : /\.upper/i.test(text)?"<code>.upper()</code> is Python. In pseudocode use <code>UCASE(...)</code>."
+             : "Convert to upper case with <code>UCASE(...)</code>."));
+       pts.push(subOk? H.yes("Correct use of SUBSTRING","8.1.4e","The first two letters of LastName are taken.")
+         : H.no("Correct use of SUBSTRING","8.1.4e", py?"Slicing such as <code>LastName[0:2]</code> is Python. In pseudocode use <code>SUBSTRING(LastName, 1, 2)</code>."
+             : anySub?"Take the first two letters of LastName and keep them in Temp: SUBSTRING takes the string, the start position, then how many characters — <code>SUBSTRING(LastName, 1, 2)</code>."
+             : "Take the first two letters with <code>SUBSTRING(LastName, 1, 2)</code>."));
+       pts.push(val&&/LASTNAME/.test(flat)? H.yes("Result stored in Temp","8.1.4e","The result is assigned to Temp.")
+         : H.no("Result stored in Temp","8.1.4e","Store the result: <code>Temp ← UCASE(SUBSTRING(LastName, 1, 2))</code>. Examiners took marks off when the result wasn't assigned to a variable."));
+       return pts;
+     }},
+    {type:"pseudo", source:"June 2024 Paper 22 Q4(b)", marks:4, ref:"8.1.4e",
+     prompt:"A product code is stored in the variable <code>Product</code>. The code must be <b>six characters</b> long and its <b>first two characters</b> must be <code>\"PD\"</code>.<br>Write the pseudocode to make sure that:<ol type=\"i\"><li>the product code is six characters in length</li><li>the first two characters of the product code are <code>\"PD\"</code>.</li></ol>",
+     placeholder:"REPEAT\n    INPUT Product\nUNTIL ...",
+     model:`REPEAT
+    INPUT Product
+UNTIL LENGTH(Product) = 6
+
+REPEAT
+    INPUT Product
+UNTIL SUBSTRING(Product, 1, 2) = "PD"
+// The mark scheme marks (i) and (ii) separately. In a real program check both together:
+// UNTIL LENGTH(Product) = 6 AND SUBSTRING(Product, 1, 2) = "PD"`,
+     mark(L,H){
+       const pts=[], text=L.map(l=>l.s).join("\n");
+       const py=/\blen\s*\(|\[\s*\d*\s*:\s*\d*\s*\]/i.test(text);
+       const LEN="LENGTH\\s*\\(\\s*Product\\s*\\)", SUB="SUBSTRING\\s*\\(\\s*Product\\s*,\\s*[01]\\s*,\\s*2\\s*\\)";
+       // the value may be stored first and the variable tested: Size ← LENGTH(Product) ... UNTIL Size = 6
+       const stored=re=>L.map(l=>l.s.match(new RegExp("^(\\w+)\\s*←\\s*"+re+"\\s*$","i"))).filter(Boolean).map(m=>"\\b"+m[1]+"\\b");
+       const lenAlt="(?:"+[LEN,...stored(LEN)].join("|")+")", subAlt="(?:"+[SUB,...stored(SUB)].join("|")+")";
+       const testLines=L.map(l=>l.s).filter(s=>/^(UNTIL|WHILE|IF)\b/i.test(s)||/←/.test(s));
+       pts.push(new RegExp(LEN,"i").test(text)? H.yes("Correct use of LENGTH","8.1.4e","LENGTH(Product) gives the number of characters.")
+         : H.no("Correct use of LENGTH","8.1.4e", py?"<code>len()</code> is Python. In pseudocode use <code>LENGTH(Product)</code>.":"Find the length with <code>LENGTH(Product)</code>."));
+       const lenTest=new RegExp(lenAlt+"\\s*(=|<>)\\s*6(?![\\d.])|\\b6\\s*(=|<>)\\s*"+lenAlt,"i");
+       pts.push(testLines.some(s=>lenTest.test(s))? H.yes("Tests that the length is 6","8.1.4e","The length is compared with 6.")
+         : H.no("Tests that the length is 6","8.1.4e","Compare the length with 6 in a check, e.g. <code>UNTIL LENGTH(Product) = 6</code>."));
+       pts.push(new RegExp(SUB,"i").test(text)? H.yes("Correct use of SUBSTRING","8.1.4e","SUBSTRING(Product, 1, 2) gives the first two characters.")
+         : H.no("Correct use of SUBSTRING","8.1.4e", py?"Slicing is Python. In pseudocode use <code>SUBSTRING(Product, 1, 2)</code>."
+             : /SUBSTRING/i.test(text)?"SUBSTRING takes the string, the start position, then how many characters: <code>SUBSTRING(Product, 1, 2)</code>."
+             : "Take the first two characters with <code>SUBSTRING(Product, 1, 2)</code>."));
+       // keywords in any case, but the string itself must be exactly "PD" (comparing strings is case-sensitive)
+       const subTest=new RegExp(subAlt+"\\s*(=|<>)\\s*[\"']PD[\"']|[\"']PD[\"']\\s*(=|<>)\\s*"+subAlt,"i");
+       const hit=testLines.find(s=>subTest.test(s));
+       pts.push(hit&&/"PD"/.test(hit)? H.yes("Tests that they are \"PD\"","8.1.4e","The first two characters are compared with \"PD\".")
+         : H.no("Tests that they are \"PD\"","8.1.4e", hit&&/'PD'/.test(hit)?"\"PD\" is a string, so use double quotation marks."
+             : hit?"Comparing strings is case-sensitive: compare with <code>\"PD\"</code> in capitals."
+             : "Compare them with the string in a check, e.g. <code>UNTIL SUBSTRING(Product, 1, 2) = \"PD\"</code>."));
+       return pts;
+     }},
+    {type:"mcq", source:"exam-style", marks:1, ref:"8.1.4e",
+     prompt:"<code>Word ← \"Computer\"</code>. What does <code>SUBSTRING(Word, 4, 3)</code> return?",
+     options:[
+       {t:"\"put\"", code:true, ok:true, why:"Correct. Position 4 is p (C-o-m-p), and 3 characters from there is \"put\"."},
+       {t:"\"pute\"", code:true, why:"The third value is how many characters to take — 3, not 4."},
+       {t:"\"mpu\"", code:true, why:"Position 4 is the p. Counting from 1: C=1, o=2, m=3, p=4."},
+       {t:"\"ute\"", code:true, why:"That starts at position 5. Pseudocode counts from 1, so position 4 is p."}
+     ]}
+  ]
+};
+
+/* ------------------------------------------------------------
+   SKILL 15 — LIBRARY ROUTINES (8.1.7)
+   ------------------------------------------------------------ */
+SKILLS.s15 = {
+  n:15, title:"Library routines", ref:"8.1.7",
+  intro:"Ready-made routines you call by name: MOD, DIV, ROUND and RANDOM. Know what each does, write the pseudocode call form exactly, and remember to round at the end.",
+  learn:[
+    {h:"Routines someone has already written", html:`
+      <p>A <b>library routine</b> is a pre-written, tested subroutine that comes with the language. You don't write it — you <b>call</b> it by name and give it values to work on.</p>
+      <p>The 0984 syllabus names four. In pseudocode they are written in <b>function-call form</b>, with the values in brackets:</p>
+      <div class="tablewrap"><table class="grid">
+        <tr><th>Pseudocode</th><th>What it returns</th><th>Python</th><th>Example</th></tr>
+        <tr><td><code>MOD(a, b)</code></td><td>the remainder when a is divided by b</td><td><code>a % b</code></td><td><code>MOD(10, 3)</code> → 1</td></tr>
+        <tr><td><code>DIV(a, b)</code></td><td>the whole-number part of a ÷ b</td><td><code>a // b</code></td><td><code>DIV(10, 3)</code> → 3</td></tr>
+        <tr><td><code>ROUND(x, places)</code></td><td>x rounded to that many decimal places</td><td><code>round(x, places)</code></td><td><code>ROUND(4.56, 1)</code> → 4.6</td></tr>
+        <tr><td><code>RANDOM()</code></td><td>a random number from 0 to 1</td><td><code>random.random()</code></td><td>e.g. 0.73</td></tr>
+      </table></div>`,
+     after:`<div class="note">In pseudocode, write <code>MOD(10, 3)</code> — not <code>10 MOD 3</code>, and not Python's <code>10 % 3</code>.</div>`},
+
+    {h:"MOD and DIV as tools", html:`
+      <p>You met MOD and DIV as operators in Skill 5. As routines they solve a few jobs that come up again and again:</p>
+      <ul><li><b>Is it even?</b> <code>MOD(Number, 2) = 0</code></li>
+      <li><b>Is it divisible by 4</b> (a leap-year test)? <code>MOD(Year, 4) = 0</code> — a divisibility test is a <b>remainder</b> test, so it's MOD, not DIV.</li>
+      <li><b>Hours and minutes:</b> <code>DIV(Total, 60)</code> hours and <code>MOD(Total, 60)</code> minutes left over.</li></ul>`,
+     py:`year = 2028
+if year % 4 == 0:
+    print("Divisible by 4")`,
+     pc:`Year ← 2028
+IF MOD(Year, 4) = 0 THEN
+    OUTPUT "Divisible by 4"
+ENDIF`},
+
+    {h:"ROUND: tidy the answer at the end", html:`
+      <p><code>ROUND(x, places)</code> rounds to a number of decimal places: <code>ROUND(4.56, 1)</code> is 4.6 and <code>ROUND(3.14159, 2)</code> is 3.14. Use 0 places for a whole number.</p>
+      <p>Do the calculation first, then round the <b>final</b> answer. Rounding halfway through can make the result wrong.</p>`,
+     py:`total = 70 + 85 + 90
+average = total / 3          # 81.666666...
+print(round(average, 1))     # 81.7`,
+     pc:`Total ← 70 + 85 + 90
+Average ← ROUND(Total / 3, 1)
+OUTPUT Average`,
+     after:`<div class="note tip">One Python quirk: when a number is exactly half way, <code>round()</code> goes to the nearest <b>even</b> number, so <code>round(2.5)</code> is 2. Cambridge's ROUND rounds a 5 up. Exam questions don't depend on this, but it explains a surprising result if you see one.</div>`},
+
+    {h:"RANDOM: make it the right range", html:`
+      <p><code>RANDOM()</code> gives a number from 0 to 1. To get the range you want, <b>multiply</b> to stretch it and <b>add</b> to move it:</p>
+      <ul><li><code>ROUND(RANDOM() * 6, 0)</code> → a whole number from <b>0 to 6</b> (the syllabus example)</li>
+      <li><code>ROUND(RANDOM() * 5, 0) + 1</code> → a whole number from <b>1 to 6</b> — a dice</li>
+      <li><code>RANDOM() * 999 + 1</code> → from <b>1 to 1000</b></li></ul>
+      <p>The trick: multiply by <b>(highest − lowest)</b>, then add the lowest. (The June 2026 mark scheme accepted <code>RANDOM() * 999 + 1</code> for "a whole number from 1 to 1000"; to be sure it is whole, <code>ROUND(RANDOM() * 999, 0) + 1</code> gives the same range.)</p>
+      <p class="muted" style="font-size:.9rem">Rounding makes the two end values slightly less likely than the others, so this isn't a perfectly fair dice — exam answers only need the right range.</p>
+      <p>In Python, <code>import random</code> at the top, then <code>random.randint(1, 6)</code> gives a whole number from 1 to 6 — <b>both ends included</b>.</p>`,
+     py:`import random
+roll = random.randint(1, 6)
+print("You rolled", roll)`,
+     pc:`Roll ← ROUND(RANDOM() * 5, 0) + 1
+OUTPUT "You rolled ", Roll`},
+
+    {h:"What the examiners say", html:`
+      <div class="exam"><h3>Examiner reports</h3>
+        <blockquote>“Most candidates were able to identify the correct purpose of MOD and DIV with only a few giving the correct pseudocode for MOD and DIV.”<cite>June 2025 Paper 21 Q5</cite></blockquote>
+        <blockquote>“Few candidates understood the purpose of DIV and ROUND.”<cite>June 2023 Paper 21 Q4</cite></blockquote>
+        <blockquote>“Some candidates used a parameter of 1000 instead of 999 and adding 1 to the result.”<cite>June 2026 Paper 21 Q5(a)</cite></blockquote>
+        <blockquote>“Many candidates, despite calculating the averages correctly and converting to Fahrenheit correctly, did not round their answer.”<cite>June 2023 Paper 21 Q11</cite></blockquote>
+        <p>Three habits: write the <b>call form</b> (<code>MOD(a, b)</code>), check your RANDOM <b>range</b> at both ends, and <b>round the final answer</b> when the question asks.</p>
+      </div>`}
+  ],
+
+  practise:[
+    {type:"value", title:"ROUND in pseudocode", ref:"8.1.7",
+     prompt:"Give the value of each pseudocode expression.<br>1. <code>ROUND(4.56, 1)</code><br>2. <code>ROUND(3.14159, 2)</code>",
+     fields:[{label:"ROUND(4.56, 1)",a:["4.6"]},{label:"ROUND(3.14159, 2)",a:["3.14"]}],
+     why:"4.56 to 1 decimal place is <b>4.6</b> (the 6 rounds the 5 up). 3.14159 to 2 decimal places is <b>3.14</b>."},
+    {type:"value", title:"The Python versions", ref:"8.1.7",
+     prompt:"What does each line print?",
+     lang:"py", code:`print(round(2.718, 1))
+print(17 % 5)
+print(17 // 5)`,
+     fields:[{label:"Line 1",a:["2.7"]},{label:"Line 2",a:["2"]},{label:"Line 3",a:["3"]}],
+     why:"<code>round(2.718, 1)</code> is <b>2.7</b>; 17 ÷ 5 is 3 remainder 2, so <code>%</code> gives <b>2</b> (MOD) and <code>//</code> gives <b>3</b> (DIV)."},
+    {type:"mcq", title:"A dice from 1 to 6", ref:"8.1.7",
+     prompt:"Which pseudocode gives a whole number from <b>1 to 6</b> inclusive?",
+     options:[
+       {t:"ROUND(RANDOM() * 5, 0) + 1", code:true, ok:true, why:"Correct. RANDOM() * 5 runs from 0 to 5; rounding makes it whole; adding 1 moves it to 1 to 6."},
+       {t:"ROUND(RANDOM() * 6, 0)", code:true, why:"That's the syllabus example — but it gives 0 to 6, and a dice has no 0."},
+       {t:"RANDOM() * 6", code:true, why:"That isn't a whole number (it could be 4.271…), and it starts at 0."},
+       {t:"ROUND(RANDOM() * 6, 0) + 1", code:true, why:"Multiplying by 6 then adding 1 gives 1 to 7. Multiply by (highest − lowest) = 5."}
+     ]},
+    {type:"mcq", title:"Leap year test", ref:"8.1.7",
+     prompt:"Which condition checks whether <code>Year</code> divides exactly by 4?",
+     options:[
+       {t:"MOD(Year, 4) = 0", code:true, ok:true, why:"Correct. Divides exactly means the remainder is 0, and MOD gives the remainder."},
+       {t:"DIV(Year, 4) = 0", code:true, why:"DIV gives the whole-number result (2028 → 507), not the remainder. Examiners saw this mix-up in June 2026."},
+       {t:"Year / 4 = 0", code:true, why:"2028 / 4 is 507, not 0. You want the remainder to be 0."},
+       {t:"MOD(4, Year) = 0", code:true, why:"The values are the wrong way round: that divides 4 by the year."}
+     ]},
+    {type:"classify", title:"Which routine?", ref:"8.1.7",
+     prompt:"Choose the library routine that does each job.",
+     options:["MOD","DIV","ROUND","RANDOM"],
+     items:[
+       {t:"Slices of pizza left over when 17 are shared between 5 people", a:"MOD", why:"Left over = the remainder → MOD."},
+       {t:"Whole slices each person gets", a:"DIV", why:"How many whole times it goes in → DIV."},
+       {t:"Show an average to 1 decimal place", a:"ROUND", why:"Decimal places → ROUND."},
+       {t:"Pick a mystery number for a guessing game", a:"RANDOM", why:"An unpredictable number → RANDOM."}
+     ]},
+    {type:"mcq", title:"Python's randint", ref:"8.1.7",
+     prompt:"After <code>import random</code>, what can <code>random.randint(1, 6)</code> return?",
+     options:[
+       {t:"Any whole number from 1 to 6, including 1 and 6", ok:true, why:"Correct. randint includes both ends — unlike range(), which stops before its end."},
+       {t:"Any whole number from 1 to 5", why:"That's how range(1, 6) behaves. randint(1, 6) includes the 6."},
+       {t:"Any whole number from 0 to 6", why:"It starts at the first value you give it, 1."},
+       {t:"A decimal between 1 and 6", why:"randint always gives a whole number (int)."}
+     ]}
+  ],
+
+  apply:[
+    {id:"a1", marks:6, title:"Average to 1 decimal place", context:"Exam",
+     brief:`<p>Write a Python program that:</p>
+      <ul><li>asks for <b>three</b> test scores (whole numbers)</li>
+      <li>works out their <b>average</b></li>
+      <li>outputs the average <b>rounded to 1 decimal place</b>, using the library routine <code>round()</code></li>
+      <li>uses clear names and at least one comment.</li></ul>
+      <p>For 70, 85 and 90 the average is 81.666… so the program shows <code>81.7</code>.</p>`,
+     example:[["out","Score 1: "],["in","70"],["out","Score 2: "],["in","85"],["out","Score 3: "],["in","90"],["out","Average: 81.7"]],
+     tests:[
+       {label:"70, 85, 90", kind:"normal", inputs:["70","85","90"], expect:"Average: 81.7"},
+       {label:"50, 50, 51", kind:"normal", inputs:["50","50","51"], expect:"Average: 50.3"},
+       {label:"60, 60, 60", kind:"normal", inputs:["60","60","60"], expect:"Average: 60.0"}
+     ],
+     hints:[
+       "Add all three first, then divide: <code>(score1 + score2 + score3) / 3</code> — the brackets matter.",
+       "Round the final answer: <code>round(average, 1)</code>.",
+       "You can round inside the print: <code>print(\"Average:\", round(average, 1))</code>."
+     ],
+     model:{py:`# Average of three test scores, rounded to 1 decimal place
+score1 = int(input("Score 1: "))
+score2 = int(input("Score 2: "))
+score3 = int(input("Score 3: "))
+average = (score1 + score2 + score3) / 3
+print("Average:", round(average, 1))`,
+       pc:`// Average of three test scores, rounded to 1 decimal place
+INPUT Score1
+INPUT Score2
+INPUT Score3
+Average ← ROUND((Score1 + Score2 + Score3) / 3, 1)
+OUTPUT "Average: ", Average`},
+          mark(R){
+       const {info,H}=R, pts=[], runs=R.runs;
+       const conv=info.inputs.length>=1&&info.inputs.every(i=>i.conv==="int"||i.conv==="float");
+       const readAll=runs.every(r=>!r.error&&r.unusedInputs===0);
+       pts.push(conv&&readAll? H.yes("Reads three scores as numbers","8.1.3","Three scores are read and converted.")
+         : H.no("Reads three scores as numbers","8.1.3", !conv?"Convert each score with <code>int(input(...))</code>.":"Read all three scores — your program didn't use every input."));
+       const usesRound=(info.calls||[]).includes("round");
+       // every decimal the run printed: the rounded average should be the only one (an average printed inside the loop shows up here)
+       const dec=r=>r.error?[]:(H.printed(r).match(/\d+\.\d+/g)||[]);
+       const only=(r,w)=>{ const d=dec(r); return d.length===1&&Math.abs(parseFloat(d[0])-w)<1e-9; };
+       const same=dec(runs[0]).join()===dec(runs[1]).join()&&dec(runs[0]).length>0;
+       const ok0=only(runs[0],81.7);
+       pts.push(usesRound? H.yes("Uses the round() library routine","8.1.7","round() gives the average to 1 decimal place.")
+         : H.no("Uses the round() library routine","8.1.7", ok0?"Your output looks right, but this task practises the library routine: use <code>round(average, 1)</code>."
+             : "Round the average with the library routine <code>round(average, 1)</code>."));
+       const d0=dec(runs[0]);
+       pts.push(ok0? H.yes("Correct rounded average for 70, 85, 90","8.1.7","245 ÷ 3 = 81.666… → 81.7, printed once.")
+         : H.no("Correct rounded average for 70, 85, 90","8.1.7", runs[0].error?"The program stopped with an error — see above."
+             : d0.some(x=>/^81\.66/.test(x))?"You worked out the average but didn't round it. That's the mark examiners see lost most often — use <code>round(average, 1)</code>."
+             : d0.length>1&&d0.includes("81.7")?`Print the average once, after all three scores have been read (we saw ${H.e(d0.join(", "))}).`
+             : d0.some(x=>Math.abs(parseFloat(x)-185)<1e-9)?"Only the third score was divided by 3. Add first, then divide: <code>(score1 + score2 + score3) / 3</code>."
+             : `For 70, 85 and 90 the output should be 81.7 (we saw ${H.e(d0.join(", ")||"no decimal number")}).`));
+       const ok12=only(runs[1],50.3)&&only(runs[2],60);
+       pts.push(ok12? H.yes("Correct for other scores too","8.1.7","50, 50, 51 → 50.3 and 60, 60, 60 → 60.0.")
+         : H.no("Correct for other scores too","8.1.7", runs[1].error?"The program stopped with an error — see above."
+             : same?"Your program printed the same answer for different scores. Work the average out from the scores that were typed in."
+             : "For 50, 50, 51 the output should be 50.3, and for 60, 60, 60 it should be 60.0."));
+       const attempted=H.attempted(pts.slice(2));
+       const avgVar=(info.assigns.find(a=>/average|avg|mean/i.test(a.name))||{}).name||null;
+       const totVar=(info.assigns.find(a=>/total|sum/i.test(a.name))||{}).name||null;
+       const roles=[{name:(info.inputs[0]||{}).var||null, ok:/score|mark|test|result|num|value|point|\d/i, label:"first score", examples:"score1"}];
+       if (avgVar||totVar) roles.push({name:avgVar||totVar, ok:/average|avg|mean|total|sum/i, label:"average or total", examples:"average"});
+       pts.push(H.identPoint(info,{attempted, hint:"score1, average", roles}));
+       pts.push(H.commentPoint(info, attempted));
+       return pts;
+     }},
+
+    {id:"a2", marks:5, title:"Roll the dice", context:"Gaming",
+     brief:`<p>Write a Python program that rolls a dice:</p>
+      <ul><li>use the <code>random</code> library to make a <b>whole number from 1 to 6</b></li>
+      <li>output it with a message, e.g. <code>You rolled 4</code></li>
+      <li>if the roll is a <b>6</b>, also output <code>Six!</code></li>
+      <li>include at least one comment.</li></ul>
+      <p>There's no input. To mark a random program fairly, the checker controls the random numbers: it makes your program produce its <b>lowest</b> possible roll in one test and its <b>highest</b> in another.</p>`,
+     example:[["out","You rolled 6\n"],["out","Six!"]],
+          tests:[
+       {label:"Lowest possible roll", kind:"extreme", inputs:[], rand:[0.0, 0.999999], expect:"You rolled 1"},
+       {label:"Highest possible roll", kind:"extreme", inputs:[], rand:[0.999999, 0.0], expect:"You rolled 6, then Six!"},
+       {label:"A middle roll", kind:"normal", inputs:[], rand:[0.5, 0.999999], expect:"A roll from 2 to 5 (no Six!)"}
+     ],
+     hints:[
+       "Put <code>import random</code> at the top of your program.",
+       "<code>random.randint(1, 6)</code> gives a whole number from 1 to 6 — both ends included.",
+       "Store the roll in a variable, print it, then use <code>if roll == 6:</code> for the extra message."
+     ],
+     model:{py:`# Dice roll
+import random
+roll = random.randint(1, 6)     # whole number 1 to 6
+print("You rolled", roll)
+if roll == 6:
+    print("Six!")`,
+       pc:`// Dice roll
+Roll ← ROUND(RANDOM() * 5, 0) + 1
+OUTPUT "You rolled ", Roll
+IF Roll = 6 THEN
+    OUTPUT "Six!"
+ENDIF`},
+          mark(R){
+       const {info,H}=R, pts=[], runs=R.runs;
+       const nums=i=>runs[i].error?[]:H.ownNums(runs,i), lines=i=>runs[i].error?[]:H.ownLines(runs,i);
+       const txt=i=>lines(i).join("\n");
+       const loopErr=runs.some(r=>r.error&&(r.error.type==="TooMuchOutput"||r.error.type==="TooManyInputs"));
+       pts.push((info.imports||[]).includes("random")? H.yes("Uses the random library","8.1.7","import random gives you the random routines.")
+         : H.no("Uses the random library","8.1.7","Put <code>import random</code> at the top and use <code>random.randint(1, 6)</code>."));
+       const one=i=>nums(i).length===1;
+       const lowOk=one(0)&&nums(0)[0]===1;
+       pts.push(lowOk? H.yes("Lowest roll is 1","8.1.7","When the random number is as small as possible, the dice shows 1.")
+         : H.no("Lowest roll is 1","8.1.7", loopErr?"Roll the dice once, with no loop."
+             : runs[0].error?"The program stopped with an error — see above."
+             : nums(0).some(v=>v<1)?`Your lowest possible roll is ${H.e(String(Math.min(...nums(0))))}, but a dice starts at 1. Use <code>random.randint(1, 6)</code> — or add 1 after scaling.`
+             : !nums(0).length?"Output the roll with a message, e.g. <code>print(\"You rolled\", roll)</code>."
+             : nums(0).length>1?"Roll once and print just that one number for the roll."
+             : "When the random number is as small as possible, your program should show 1."));
+       const whole=[0,1,2].every(i=>!/\d\.\d/.test(txt(i)));
+       const midOk=one(2)&&nums(2)[0]>=1&&nums(2)[0]<=6;
+       const highOk=one(1)&&nums(1)[0]===6&&whole&&midOk;
+       pts.push(highOk? H.yes("Highest roll is 6, a whole number","8.1.7","At the top of the range the dice shows 6 — never 7, never a decimal.")
+         : H.no("Highest roll is 6, a whole number","8.1.7", loopErr?"Roll the dice once, with no loop."
+             : runs[1].error?"The program stopped with an error — see above."
+             : !whole?"A dice shows whole numbers. Use <code>random.randint(1, 6)</code>, which always gives an int."
+             : nums(1).some(v=>v>6)?`Your highest possible roll is ${H.e(String(Math.max(...nums(1))))}. randint includes both ends, so use <code>random.randint(1, 6)</code>.`
+             : "When the random number is as large as possible, your program should show 6 (and one roll number each time)."));
+       // the Six! line must appear only in the run that rolled 6 ("Not a six" in other runs is fine)
+       const sixLines=lines(1).filter(l=>/six/i.test(l)&&!/\d/.test(l));
+       const sixOk=sixLines.length>0&&!sixLines.some(l=>lines(0).includes(l)||lines(2).includes(l));
+       pts.push(sixOk? H.yes("Says Six! only for a 6","8.1.4b","The extra message appears for a 6 and not otherwise.")
+         : H.no("Says Six! only for a 6","8.1.4b", !sixLines.length?"When the roll is 6, also output <code>Six!</code>, using <code>if roll == 6:</code>."
+             : "<code>Six!</code> appeared for a roll that wasn't 6. Store the roll in a variable, then test that same variable: <code>if roll == 6:</code> (calling randint again makes a new roll)."));
+       pts.push(H.commentPoint(info, H.attempted(pts.slice(1))));
+       return pts;
+     }}
+  ],
+
+  check:[
+    {type:"pseudo", source:"June 2026 Paper 21 Q5(a)", marks:2, ref:"8.1.7",
+     prompt:"A system adds a random number to each new username.<br>Write the pseudocode to generate a whole random number between <b>1 and 1000</b> inclusive and store it in the variable <code>GeneratedNumber</code>.",
+     placeholder:"GeneratedNumber ← ...",
+     model:`GeneratedNumber ← RANDOM() * 999 + 1
+// The June 2026 mark scheme accepted this. ROUND(RANDOM() * 999, 0) + 1 also gives a whole number from 1 to 1000.`,
+          mark(L,H){
+       const pts=[], text=L.map(l=>l.s).join("\n");
+       // Follow the assignments in order (so two-line answers work), then work out the lowest and highest
+       // values of GeneratedNumber by putting RANDOM() = 0 and RANDOM() = 1 into the expression.
+       const vars={};
+       L.forEach(l=>{ const m=l.s.match(/^(\w+)\s*←\s*(.+)$/); if(!m) return;
+         let rhs=m[2]; Object.entries(vars).forEach(([n,e])=>{ rhs=rhs.replace(new RegExp("\\b"+n+"\\b","gi"),"("+e+")"); });
+         vars[m[1].toLowerCase()]=rhs; });
+       const expr=vars["generatednumber"]||"";
+       const at=r=>{ let s=expr.toUpperCase().replace(/\s+/g,""); if(!/RANDOM\(\)/.test(s)) return null;
+         s=s.replace(/RANDOM\(\)/g,"("+r+")").replace(/ROUND\(/g,"R(");
+         if(!/^[\d.+\-*/(),R]+$/.test(s)) return null;
+         try{ const v=new Function("R","return ("+s+");")((x,p)=>{ const f=Math.pow(10,p||0); return Math.round(x*f)/f; }); return Number.isFinite(v)?v:null; }catch(e){ return null; } };
+       const lo=at(0), hi=at(1);
+       const ok=lo!==null&&hi!==null&&Math.abs(lo-1)<1e-9&&Math.abs(hi-1000)<1e-9;
+       const flat=text.replace(/\s+/g,"").toUpperCase();
+       pts.push(ok? H.yes("Correct use of RANDOM() * 999 + 1","8.1.7","It gives 1 when RANDOM() is 0 and 1000 when RANDOM() is 1.")
+         : H.no("Correct use of RANDOM() * 999 + 1","8.1.7", /RANDINT|RANDOM\.RANDOM|IMPORT/.test(flat)?"That's Python. In pseudocode use <code>RANDOM()</code>."
+             : lo===null||hi===null?(/RANDOM\(\)/.test(flat)?"Store a calculation using <code>RANDOM()</code> in GeneratedNumber, e.g. <code>GeneratedNumber ← RANDOM() * 999 + 1</code>.":"Use the library routine <code>RANDOM()</code>: <code>RANDOM() * 999 + 1</code>.")
+             : Math.abs(hi-1001)<1e-9?"That goes up to 1001 — multiplying by 1000 then adding 1 is the exact slip examiners reported in June 2026. Multiply by 999: <code>RANDOM() * 999 + 1</code>."
+             : `Your expression gives values from ${H.e(String(+lo.toFixed(3)))} to ${H.e(String(+hi.toFixed(3)))}, but it should give 1 to 1000. Multiply by 999 (highest − lowest), then add 1.`));
+       pts.push(expr&&/RANDOM/i.test(expr)? H.yes("Stored in GeneratedNumber","8.1.7","The random number is assigned to GeneratedNumber.")
+         : H.no("Stored in GeneratedNumber","8.1.7","Assign the result: <code>GeneratedNumber ← RANDOM() * 999 + 1</code>."));
+       return pts;
+     }},
+    {type:"selfmark", source:"June 2025 Paper 21 Q5", marks:4, ref:"8.1.7",
+     prompt:"Two library routines used in programming are <code>MOD</code> and <code>DIV</code>.<br>State the <b>purpose</b> of each of the library routines.<br>Give <b>one example pseudocode statement</b> for each of the library routines.",
+     scheme:["MOD – returns the remainder of a division calculation",
+             "Example: X ← MOD(10, 3)",
+             "DIV – integer division / returns the quotient of a division (only the whole number part is kept)",
+             "Example: Y ← DIV(10, 3)"],
+     schemeNote:"One mark for each bullet point. The examiners noted that most candidates knew the purposes but only a few wrote the correct pseudocode — the function form MOD(10, 3), not 10 MOD 3 or 10 % 3."},
+    {type:"pseudo", source:"exam-style", marks:3, ref:"8.1.7",
+     prompt:"A running app stores the total distance a runner has covered, in kilometres, in <code>Total</code>, and the number of runs in <code>Runs</code>.<br>Write pseudocode to work out the <b>average distance per run</b>, <b>rounded to 1 decimal place</b>, store it in <code>Average</code>, then output it.",
+     placeholder:"Average ← ...\nOUTPUT ...",
+     model:`Average ← ROUND(Total / Runs, 1)
+OUTPUT "Average distance: ", Average`,
+          mark(L,H){
+       const pts=[], text=L.map(l=>l.s).join("\n");
+       const isPy=/^Average\s*=/im.test(text)||/\bprint\s*\(/i.test(text);
+       pts.push(/Total\s*\/\s*Runs/i.test(text)? H.yes("Calculates Total / Runs","8.1.7","The average is the total divided by the number of runs.")
+         : H.no("Calculates Total / Runs","8.1.7", /DIV\s*\(\s*Total/i.test(text)?"DIV would throw away the decimal part. Use ordinary division: <code>Total / Runs</code>.":"The average is <code>Total / Runs</code>."));
+       const rre=/ROUND\s*\(\s*\(?\s*(Total\s*\/\s*Runs|Average)\s*\)?\s*,\s*1\s*\)/i;
+       // the ROUNDED value has to reach Average or the output
+       const rVars=L.map(l=>l.s.match(/^(\w+)\s*←\s*(.+)$/)).filter(m=>m&&rre.test(m[2])).map(m=>m[1]);
+       const reaches=rVars.some(v=>/^average$/i.test(v)) || L.some(l=>/^OUTPUT\b/i.test(l.s)&&(rre.test(l.s)||rVars.some(v=>new RegExp("\\b"+v+"\\b","i").test(l.s))));
+       pts.push(reaches? H.yes("Rounds with ROUND(..., 1)","8.1.7","ROUND gives 1 decimal place, and that rounded value is what's stored and output.")
+         : H.no("Rounds with ROUND(..., 1)","8.1.7", rVars.length?"You rounded into another variable but output the unrounded Average. Store the rounded value in Average: <code>Average ← ROUND(Total / Runs, 1)</code>."
+             : /ROUND/i.test(text)?"Round to 1 decimal place: <code>ROUND(Total / Runs, 1)</code> — the second value is the number of places."
+             : "Round the average with <code>ROUND(Total / Runs, 1)</code>. Forgetting to round is the mark examiners see lost most often."));
+       const aIdx=L.findIndex(l=>/^Average\s*←/i.test(l.s));
+       const outIdx=L.findIndex((l,k)=>k>aIdx&&/^OUTPUT\b.*\bAverage\b/i.test(l.s));
+       pts.push(aIdx>=0&&outIdx>aIdx? H.yes("Stored in Average, then output","8.1.3","The result is assigned to Average and then output.")
+         : H.no("Stored in Average, then output","8.1.3", isPy?"In pseudocode, assign with <code>←</code> (not =) and use <code>OUTPUT</code> (not print). = and print() are Python."
+             : aIdx<0?"Store the result: <code>Average ← ROUND(Total / Runs, 1)</code>.":"After working it out, <code>OUTPUT</code> the Average."));
+       return pts;
+     }}
+  ]
+};
+
 /* ============================================================
    GAME LAYER — XP, levels, streaks, badges, locks, celebrations.
    XP is worked out from saved progress (never stored), so it
@@ -4465,7 +5215,7 @@ const LEVELS = [
   [0,"Beginner"],[60,"Explorer"],[150,"Builder"],[280,"Coder"],
   [450,"Debugger"],[650,"Developer"],[900,"Pro"],[1200,"Ace"],
   [1600,"Expert"],[2100,"Architect"],[2700,"Master"],[3400,"Champion"],
-  [4300,"Grandmaster"],[5300,"Legend"]
+  [4300,"Grandmaster"],[5000,"Hero"],[5800,"Legend"]
 ];
 const GROUP_COLOUR = {A:"violet",B:"blue",C:"teal",D:"orange",E:"pink",F:"green",G:"amber",H:"red"};
 const STAGE_ICON = {learn:"📖",practise:"✏️",apply:"💻",check:"🎓"};
@@ -4815,7 +5565,7 @@ function renderHome(){
       const s=SKILLS[id], p=P(id);
       const pr = s.practise.filter((_,i)=>p.practise[i]).length;
       const ap = s.apply.map(a=>p.apply[a.id]?`${a.title} ${p.apply[a.id].got}/${p.apply[a.id].of}`:`${a.title} not attempted`).join("; ");
-      const ck = s.check.map((c,i)=>p.check[i]!==undefined?`${p.check[i]}/${c.marks}`:"–").join(", ");
+      const ck = s.check.map((c,i)=>p.check[i]!==undefined?`${p.check[i]}/${c.marks}${c.type==="selfmark"?" (self-marked)":""}`:"–").join(", ");
       lines.push(`Skill ${s.n} ${s.title} (${s.ref}): ${skillPct(id)}% | Learn ${p.learn?"done":"not yet"} | Practise ${pr}/${s.practise.length} | Apply: ${ap} | Checkpoint marks: ${ck}`);
     });
     const txt = lines.join("\n"), status=$("#sumst");
@@ -4977,9 +5727,11 @@ function qValue(q, box, attempt){
       let ok = f.a.some(a=> answerMatch(v, a, f.exact));
       if (!ok){
         all=false;
-        const near = f.a.find(a=>v.replace(/\s+/g,"").toLowerCase()===a.replace(/\s+/g,"").toLowerCase());
+        const caseOnly = f.a.find(a=>v.toLowerCase()===String(a).toLowerCase());
+        const near = f.a.find(a=>v.replace(/\s+/g,"")===a.replace(/\s+/g,""));
         const quoted = f.a.find(a=>v.replace(/["']/g,"").replace(/,\s*/g," ").replace(/\s+/g," ").trim().toLowerCase()===a.toLowerCase());
-        if (/["']/.test(v) && quoted) msgs.push(`${esc(f.label)}: remove the quotation marks. The user never sees them.`);
+        if (caseOnly) msgs.push(`${esc(f.label)}: the letters are right, but check the <b>capitals</b>. Python treats upper and lower case as different.`);
+        else if (/["']/.test(v) && quoted) msgs.push(`${esc(f.label)}: remove the quotation marks. The user never sees them.`);
         else if (near) msgs.push(`${esc(f.label)}: the characters are right, but check the <b>spaces</b>.`);
         else msgs.push(`${esc(f.label)}: not quite.`);
       }
@@ -5264,7 +6016,7 @@ function wireApply(id, a){
     const btn=$(".chk",root); btn.disabled=true;
     st.textContent = PY.worker ? "Running your code…" : "Loading Python (the first time takes a few seconds)…";
     let out;
-    try { out = await PY.check(src, a.tests.map(t=>({inputs:t.inputs, overrides:t.overrides||null}))); }
+    try { out = await PY.check(src, a.tests.map(t=>({inputs:t.inputs, overrides:t.overrides||null, rand:t.rand||null}))); }
     catch(e){ st.textContent=""; btn.disabled=false; $(".result",root).innerHTML=`<div class="errbox"><b>Couldn't load the Python checker.</b><div>Check your internet connection and try again. Learn and Practise still work offline.</div></div>`; return; }
     btn.disabled=false;
     const b=snap(), wasReady=applyReady(id), wasFull=p.apply[a.id]&&p.apply[a.id].got===p.apply[a.id].of;
