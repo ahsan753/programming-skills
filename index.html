@@ -406,13 +406,47 @@ code,pre,kbd,samp,textarea,input,.opt.code .ot,.fields input,table.trace input,.
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]) :is(.btn.go,figure.code figcaption,.modelhead,.qhead .qn,.opt.right .ol,.mp.ok .ic){color:#0f0b24}}
 :root[data-theme="dark"] :is(.btn.go,figure.code figcaption,.modelhead,.qhead .qn,.opt.right .ol,.mp.ok .ic){color:#0f0b24}
 
+/* ---------- account (sign in / cloud save) ---------- */
+.acctbtn{flex:none;display:inline-flex;align-items:center;gap:6px;height:40px;padding:0 12px;border-radius:12px;border:2px solid var(--rule-2);background:var(--paper);color:var(--ink);font:inherit;font-weight:800;font-size:.92rem;box-shadow:0 3px 0 var(--rule-2);cursor:pointer;transition:transform .06s, box-shadow .06s;max-width:160px}
+.acctbtn:hover{filter:brightness(1.03)}
+.acctbtn:active{transform:translateY(2px);box-shadow:0 1px 0 var(--rule-2)}
+.acctbtn.out{background:var(--violet);border-color:var(--violet);color:#fff;box-shadow:0 3px 0 var(--violet-d)}
+.acctbtn.warn{background:var(--amber-w);border-color:var(--amber)}
+.acctbtn .acctname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.acctbtn .dot{width:10px;height:10px;border-radius:50%;flex:none;background:var(--ink-3)}
+.acctbtn.st-saved .dot{background:var(--green)}
+.acctbtn.st-saving .dot,.acctbtn.st-loading .dot{background:var(--amber)}
+.acctbtn.st-offline .dot{background:var(--red)}
+@media (max-width:620px){.acctbtn{padding:0 10px}.acctbtn.out .acctname,.acctbtn.warn .acctname{display:none}.acctbtn.in .acctname{max-width:70px}}
+.acctbox{text-align:left}
+.acctbox h2{text-align:center}
+.acctbox>.btn{margin-top:10px}
+.acctform{display:grid;gap:12px;margin-top:12px}
+.acctform label{display:grid;gap:4px;font-weight:800}
+.acctform input[type=text],.acctform input[type=password]{width:100%}
+input[type=password]{font:inherit;font-weight:600;color:var(--ink);background:var(--paper);border:2px solid var(--rule-2);border-radius:12px;padding:9px 12px}
+input[type=password]:focus{outline:none;border-color:var(--violet);box-shadow:0 0 0 4px var(--violet-w)}
+.acctform .chk{display:flex;gap:10px;align-items:flex-start;font-weight:700}
+.acctform .chk input{width:20px;height:20px;margin-top:2px;accent-color:var(--violet)}
+.acctform .chk small{display:block;color:var(--ink-2);font-weight:600}
+.acctform .errbox{margin:0}
+.acctbox .small{font-size:.86rem;margin-top:12px}
+.signin-note{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.acctbtn[hidden]{display:none}
+.acctbtn .acctico{display:none}
+@media (max-width:420px){
+  .top .wrap{gap:6px}.hud{gap:6px}.hudmid{min-width:60px}
+  .acctbtn{padding:0 8px;gap:4px}.acctbtn.in .acctname{display:none}.acctbtn.in .acctico{display:inline}
+  .themebtn{width:36px;height:36px}
+}
+
 </style>
 </head>
 <body>
-<header class="top"><div class="wrap"><a class="brand" href="#"><span class="logo">{ }</span><span>Programming Skills<small>Cambridge IGCSE CS 0984</small></span></a><span class="spacer"></span><button id="themebtn" class="themebtn" type="button" aria-label="Switch colour theme" title="Switch between light and dark">🌙</button><div id="hud" class="hud"></div></div></header>
+<header class="top"><div class="wrap"><a class="brand" href="#"><span class="logo">{ }</span><span>Programming Skills<small>Cambridge IGCSE CS 0984</small></span></a><span class="spacer"></span><button id="acctbtn" class="acctbtn out" type="button" aria-label="Sign in to save your progress">👤<span class="acctname"> Sign in</span></button><button id="themebtn" class="themebtn" type="button" aria-label="Switch colour theme" title="Switch between light and dark">🌙</button><div id="hud" class="hud"></div></div></header>
 <div class="wrap"><p id="previewnotice" class="note" hidden>Teacher preview: stages are unlocked. XP, streaks and badges are disabled; student progress is not saved or changed. <a href="?">Return to student mode</a></p><p id="savewarning" class="errbox" role="alert" hidden>Progress could not be saved in this browser. Keep this tab open and copy your progress before leaving.</p></div>
 <main class="wrap" id="app"></main>
-<footer class="wrap foot">Mapped to the Cambridge IGCSE (9–1) Computer Science 0984 syllabus for 2026–2028. Your code runs in your browser and is not sent anywhere. Progress is saved on this device only.</footer>
+<footer class="wrap foot">Mapped to the Cambridge IGCSE (9–1) Computer Science 0984 syllabus for 2026–2028. Your code is checked in your browser. Progress is saved in this browser and, when you sign in, to your account (including saved code) so you can carry on from any computer.</footer>
 <script type="text/plain" id="harness">
 # Marking harness: runs inside Pyodide (Python in the browser).
 # analyse() inspects the pupil's code without running it; run() executes it
@@ -5362,6 +5396,316 @@ function badgeShelf(){
 }
 
 /* ============================================================
+   CLOUD — optional sign-in with teacher-made logins, and progress
+   sync to Supabase. This browser keeps the working copy (one copy
+   per account, so students sharing a computer never mix); the
+   account copy is merged in with the same best-result rules
+   (mergeProgress), so nothing earned is ever lost.
+   ============================================================ */
+const CLOUD_URL = "https://nqmxehehpmlnlvwokoxn.supabase.co";
+const CLOUD_KEY = "sb_publishable_HKmDz5iT4p-us2jHHBaU0w_tbjJatC1"; // public by design: Row Level Security protects the data
+const CLOUD_DOMAIN = "students.invalid";                               // must match source/supabase/students.js
+const STORE_BASE = "igcse-progskills-v1";
+
+const CLOUD = (()=>{
+  const SESSION = "ps-session", IMPORT = "ps-import";
+  const box = name => { try { const s = window[name]; s.length; return s; } catch(e){ return null; } };
+  const ls = box("localStorage"), ss = box("sessionStorage");
+  const get = (st,k) => { try { return st ? st.getItem(k) : null; } catch(e){ return null; } };
+  const put = (st,k,v) => { try { if (st) st.setItem(k,v); } catch(e){} };
+  const del = (st,k) => { try { if (st) st.removeItem(k); } catch(e){} };
+  const USER = /^[a-z0-9][a-z0-9._-]{1,39}$/;
+
+  function readSession(){
+    for (const st of [ss, ls]){
+      try {
+        const s = JSON.parse(get(st, SESSION));
+        if (s && typeof s.access_token==="string" && typeof s.refresh_token==="string" && /^[0-9a-f-]{36}$/.test(s.uid||"")) return s;
+      } catch(e){}
+    }
+    return null;
+  }
+  let session = TEACHER ? null : readSession();
+  const uid = session ? session.uid : null;          // fixed for this page load (the local store key depends on it)
+  const storeKey = () => uid ? `${STORE_BASE}:${uid}` : STORE_BASE;
+  // Only the account this page loaded with may sync; a sign-in mid-page always reloads first.
+  const live = () => !!session && session.uid===uid;
+  const saveSession = () => { if (session) put(session.remember ? ls : ss, SESSION, JSON.stringify(session)); };
+  const dropSession = () => { del(ls, SESSION); del(ss, SESSION); };
+
+  // off | loading | saving | saved | offline | expired
+  let status = session ? "loading" : "off";
+  let base = null, known = false, lastSaved = "", savedAt = null;
+  let timer = null, busy = false, again = false, retry = 0, hiddenAt = 0;
+
+  /* ---------- network ---------- */
+  async function auth(path, body, token){
+    const headers = {apikey: CLOUD_KEY, "Content-Type": "application/json"};
+    if (token) headers.Authorization = "Bearer " + token;
+    const r = await fetch(`${CLOUD_URL}/auth/v1/${path}`, {method: "POST", headers, body: JSON.stringify(body||{})});
+    let data = null; try { data = await r.json(); } catch(e){}
+    return {ok: r.ok, status: r.status, data};
+  }
+  function adopt(d, extra){
+    session = {...(session||{}), ...extra, access_token: d.access_token, refresh_token: d.refresh_token,
+               expires_at: Date.now() + (d.expires_in||3600)*1000, uid: d.user.id};
+    saveSession();
+  }
+  let refreshing = null;
+  function refresh(){
+    if (!refreshing) refreshing = (async()=>{
+      // Another tab may already have rotated the refresh token.
+      const s = readSession();
+      if (s && s.uid===session.uid && s.expires_at > Date.now()+60000){ session = s; return true; }
+      const r = await auth("token?grant_type=refresh_token", {refresh_token: session.refresh_token});
+      if (r.ok && r.data && r.data.access_token && r.data.user && r.data.user.id===session.uid){ adopt(r.data); return true; }
+      if (r.status>=400 && r.status<500){ expire(); return false; }
+      throw new Error("offline");
+    })().finally(()=>{ refreshing = null; });
+    return refreshing;
+  }
+  async function rest(path, opts={}, retried=false){
+    if (!session) throw new Error("signed out");
+    if (Date.now() > session.expires_at - 60000 && !(await refresh())) throw new Error("signed out");
+    const r = await fetch(`${CLOUD_URL}/rest/v1/${path}`, {...opts, headers: {apikey: CLOUD_KEY, Authorization: "Bearer " + session.access_token, "Content-Type": "application/json"}});
+    if (r.status===401 && !retried){ if (await refresh()) return rest(path, opts, true); throw new Error("signed out"); }
+    if (!r.ok) throw new Error("http " + r.status);
+    const t = await r.text(); return t ? JSON.parse(t) : null;
+  }
+  function expire(){ session = null; dropSession(); status = "expired"; paint(); }
+
+  /* ---------- sync ---------- */
+  const mark = ok => put(ls, storeKey()+":synced", ok ? "1" : "0");
+  async function pull(){
+    const rows = await rest("progress?select=data,updated_at");
+    known = true;
+    const row = rows && rows[0];
+    base = row ? row.updated_at : null;
+    if (!row) return false;
+    lastSaved = JSON.stringify(row.data);
+    const before = JSON.stringify(PROG);
+    mergeProgress(cleanProgress(row.data));
+    return JSON.stringify(PROG) !== before;
+  }
+  function merged(first){
+    saveLocal(); hud();
+    const typing = document.activeElement && document.activeElement.matches("input,textarea,select");
+    if (!typing && (first || !location.hash)) route();
+  }
+  async function push(){
+    if (!known && await pull()) merged(false);
+    for (let i=0; i<5; i++){
+      const snap = JSON.stringify(PROG);
+      if (snap===lastSaved && base){ done(snap); return; }
+      const v = await rest("rpc/save_progress", {method: "POST", body: `{"p_base":${JSON.stringify(base)},"p_data":${snap}}`});
+      if (v){ base = v; done(snap); return; }
+      if (await pull()) merged(false);        // another device saved first: merge theirs, then try again
+    }
+    throw new Error("conflict");
+  }
+  function done(snap){
+    lastSaved = snap; savedAt = new Date();
+    const clean = JSON.stringify(PROG)===snap;
+    mark(clean); set(clean ? "saved" : "saving");
+    if (!clean) schedule(1500);
+  }
+  function schedule(ms){ clearTimeout(timer); timer = setTimeout(run, ms); }
+  async function run(){
+    timer = null;
+    if (!live()) return;
+    if (busy){ again = true; return; }
+    busy = true;
+    try { await push(); retry = 0; }
+    catch(e){
+      if (session){ set("offline"); retry = Math.min((retry||2500)*2, 60000); schedule(retry); }
+    }
+    finally { busy = false; if (again){ again = false; schedule(0); } }
+  }
+  function queue(){
+    if (!live() || TEACHER) return;
+    mark(false);
+    if (status!=="offline") set("saving");
+    if (!timer || retry===0) schedule(2500);
+  }
+  function flushOnLeave(){
+    // Best effort while the page closes. If the cloud copy changed elsewhere the write is refused
+    // and this browser's copy is merged in next time (nothing is lost).
+    if (!live() || !known || Date.now() > session.expires_at - 30000) return;
+    const snap = JSON.stringify(PROG);
+    if (snap===lastSaved || snap.length > 60000) return;
+    try {
+      fetch(`${CLOUD_URL}/rest/v1/rpc/save_progress`, {method: "POST", keepalive: true,
+        headers: {apikey: CLOUD_KEY, Authorization: "Bearer " + session.access_token, "Content-Type": "application/json"},
+        body: `{"p_base":${JSON.stringify(base)},"p_data":${snap}}`});
+    } catch(e){}
+  }
+
+  /* ---------- tidy shared computers ---------- */
+  // Signed out: forget other accounts' local copies once they are safely in the cloud.
+  function tidy(){
+    if (session || !ls) return;
+    try {
+      const keys = []; for (let i=0; i<ls.length; i++) keys.push(ls.key(i));
+      keys.filter(k => k && k.startsWith(STORE_BASE+":") && !k.endsWith(":synced") && get(ls, k+":synced")==="1")
+          .forEach(k => { del(ls, k); del(ls, k+":synced"); });
+    } catch(e){}
+  }
+  function startedSkills(raw){
+    let data; try { data = cleanProgress(JSON.parse(raw)); } catch(e){ return []; }
+    return liveSkills().filter(id => { const p = data[id];
+      return p.learn || Object.keys(p.practise).length || Object.keys(p.apply).length || Object.keys(p.check).length; })
+      .map(id => SKILLS[id].n);
+  }
+
+  /* ---------- interface ---------- */
+  const TEXT = {
+    loading: "Loading your saved progress…", saving: "Saving to your account…",
+    saved: "Progress saved to your account", offline: "Not saved online yet. Will keep trying.",
+    expired: "Signed out. Sign in again to keep saving online.", off: "Progress is saved on this computer only"
+  };
+  function set(s){ status = s; paint(); }
+  function who(){ return session ? (session.name || session.username) : ""; }
+  function paint(){
+    const b = document.getElementById("acctbtn");
+    if (b){
+      b.hidden = TEACHER;
+      const signedIn = !!session;
+      b.className = "acctbtn " + (signedIn ? "in st-" + status : status==="expired" ? "warn" : "out");
+      b.innerHTML = signedIn
+        ? `<span class="dot" aria-hidden="true"></span><span class="acctname">${esc(who().split(" ")[0])}</span><span class="acctico" aria-hidden="true">👤</span>`
+        : status==="expired" ? `⚠️<span class="acctname"> Sign in again</span>` : `👤<span class="acctname"> Sign in</span>`;
+      b.title = signedIn ? `Signed in as ${who()}. ${TEXT[status]||""}` : TEXT[status]||"Sign in";
+      b.setAttribute("aria-label", signedIn ? `Account: ${who()}. ${TEXT[status]||""}` : "Sign in to save your progress");
+    }
+    const st = document.getElementById("acct-status");
+    if (st) st.textContent = statusLine();
+  }
+  function statusLine(){
+    if (status==="saved" && savedAt) return `✓ Saved to your account at ${savedAt.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})}`;
+    return TEXT[status] || "";
+  }
+
+  function dialog(html, onClose){
+    document.querySelectorAll(".modal.acct").forEach(m => m.remove());
+    const opener = document.activeElement;
+    const m = document.createElement("div"); m.className = "modal acct"; m.dataset.route = location.hash;
+    m.innerHTML = `<div class="mbox acctbox" role="dialog" aria-modal="true" aria-labelledby="acct-h">${html}</div>`;
+    document.body.appendChild(m);
+    const close = () => { m.remove(); document.removeEventListener("keydown", onKey); if (onClose) return onClose(); if (opener && opener.focus) opener.focus(); };
+    const onKey = e => {
+      if (!document.body.contains(m)) return document.removeEventListener("keydown", onKey);
+      if (e.key==="Escape") close();
+      if (e.key==="Tab"){
+        const f = [...m.querySelectorAll("button,input,a[href]")].filter(x => !x.disabled && x.offsetParent);
+        if (!f.length) return;
+        if (e.shiftKey && document.activeElement===f[0]){ e.preventDefault(); f[f.length-1].focus(); }
+        else if (!e.shiftKey && document.activeElement===f[f.length-1]){ e.preventDefault(); f[0].focus(); }
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    m.onclick = e => { if (e.target===m || e.target.closest("[data-close]")) close(); };
+    return {m, close};
+  }
+
+  function openAccount(){
+    if (TEACHER) return;
+    if (session) return accountDialog();
+    const {m} = dialog(`
+      <h2 id="acct-h">Sign in</h2>
+      <p>Use the username and password your teacher gave you. Your progress is then saved to your account, so you can carry on from any computer.</p>
+      <form class="acctform" novalidate>
+        <label>Username<input type="text" name="u" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="40"></label>
+        <label>Password<input type="password" name="p" autocomplete="current-password" maxlength="72"></label>
+        <label class="chk"><input type="checkbox" name="r"><span>Keep me signed in on this computer<small>Only tick this on your own device.</small></span></label>
+        <p class="errbox" role="alert" hidden></p>
+        <button class="btn primary big wide" type="submit">Sign in</button>
+        <button class="btn wide" type="button" data-close>Cancel</button>
+      </form>
+      <p class="muted small">Forgotten your password? Ask your teacher to reset it.</p>`);
+    const form = m.querySelector("form"), err = m.querySelector(".errbox"), btn = form.querySelector("[type=submit]");
+    const fail = msg => { err.textContent = msg; err.hidden = false; btn.disabled = false; btn.textContent = "Sign in"; };
+    form.u.focus();
+    form.onsubmit = async e => {
+      e.preventDefault();
+      const u = form.u.value.trim().toLowerCase(), p = form.p.value;
+      if (!USER.test(u)) return fail("Check your username. It's the one your teacher gave you, for example ali.khan");
+      if (!p) return fail("Type your password.");
+      btn.disabled = true; btn.textContent = "Signing in…"; err.hidden = true;
+      let r;
+      try { r = await auth("token?grant_type=password", {email: `${u}@${CLOUD_DOMAIN}`, password: p}); }
+      catch(e){ return fail("Can't reach the server. Check your internet connection and try again."); }
+      if (!r.ok || !r.data || !r.data.user) return fail(r.status===429 ? "Too many attempts. Wait a minute, then try again."
+        : r.status===400 ? "That username and password don't match. Check them and try again." : "Sign-in isn't working right now. Try again soon.");
+      session = null;
+      adopt(r.data, {username: u, name: "", remember: form.r.checked});
+      try {
+        const rows = await rest(`students?select=display_name&id=eq.${session.uid}`);
+        if (rows && rows[0] && rows[0].display_name) { session.name = String(rows[0].display_name).slice(0,60); saveSession(); }
+      } catch(e){}
+      const anon = get(ls, STORE_BASE), skills = uid ? [] : startedSkills(anon);
+      if (!skills.length) return location.reload();
+      const list = skills.length > 3 ? `Skills ${skills.slice(0,3).join(", ")} and ${skills.length-3} more` : `Skill${skills.length>1?"s":""} ${skills.join(", ")}`;
+      const q = dialog(`
+        <h2 id="acct-h">Add this computer's progress?</h2>
+        <p>This browser already has progress that isn't linked to an account (${list}).</p>
+        <p><b>Only add it if it's your own work.</b> On a shared computer it may belong to someone else.</p>
+        <button class="btn primary big wide" data-yes>Yes, it's mine: add it</button>
+        <button class="btn wide" data-close>No, leave it</button>`, () => location.reload());   // closing = No
+      q.m.querySelector("[data-yes]").onclick = () => { put(ss, IMPORT, "1"); location.reload(); };
+      q.m.querySelector("[data-yes]").focus();
+    };
+  }
+
+  function accountDialog(){
+    const {m} = dialog(`
+      <h2 id="acct-h">Your account</h2>
+      <p>Signed in as <b>${esc(who())}</b>${session.name ? ` (${esc(session.username)})` : ""}</p>
+      <p class="status" id="acct-status" role="status">${esc(statusLine())}</p>
+      <button class="btn primary big wide" data-close>Keep going</button>
+      <button class="btn wide" data-out>Sign out</button>
+      <p class="muted small">On a shared computer, always sign out when you finish.</p>`);
+    m.querySelector("[data-close]").focus();
+    m.querySelector("[data-out]").onclick = signOut;
+  }
+
+  async function signOut(){
+    const key = storeKey();
+    for (let i=0; busy && i<50; i++) await new Promise(r => setTimeout(r, 100));
+    if (live() && (JSON.stringify(PROG)!==lastSaved || timer)){
+      clearTimeout(timer); timer = null;
+      try { await push(); } catch(e){}
+    }
+    const safe = JSON.stringify(PROG)===lastSaved;
+    if (!safe && !confirm("Your latest progress hasn't saved to your account yet. If you sign out now, it stays on this computer and is saved next time you sign in here. Sign out anyway?")) return;
+    const token = session && session.access_token;
+    if (token) { try { await auth("logout", {}, token); } catch(e){} }
+    if (safe){ del(ls, key); del(ls, key+":synced"); }
+    dropSession(); location.reload();
+  }
+
+  async function start(){
+    tidy(); paint();
+    document.addEventListener("click", e => { if (e.target.closest("#acctbtn,[data-signin]")) openAccount(); });
+    if (!live()) return;
+    if (get(ss, IMPORT)==="1"){
+      del(ss, IMPORT);
+      try { mergeProgress(cleanProgress(JSON.parse(get(ls, STORE_BASE)))); saveLocal(); del(ls, STORE_BASE); } catch(e){}
+    }
+    addEventListener("pagehide", flushOnLeave);
+    document.addEventListener("visibilitychange", () => {
+      if (!live()) return;
+      if (document.visibilityState==="hidden"){ hiddenAt = Date.now(); if (timer && !busy){ clearTimeout(timer); run(); } }
+      else if (hiddenAt && Date.now()-hiddenAt > 60000 && !busy){ known = false; schedule(0); }   // pick up work done on another computer
+    });
+    addEventListener("online", () => { if (live() && status==="offline") schedule(0); });
+    try { if (await pull()) merged(true); } catch(e){ if (session){ set("offline"); schedule(5000); } return; }
+    run();
+  }
+
+  return {storeKey, queue, start, openAccount, signedIn: () => !!session, who, username: () => session ? session.username : ""};
+})();
+
+/* ============================================================
    APP — routing, rendering, marking helpers, Python runner.
    ============================================================ */
 const $ = (s, el=document) => el.querySelector(s);
@@ -5373,8 +5717,8 @@ const STAGES = [
   {id:"check", name:"Checkpoint", sub:"Exam-style questions"}
 ];
 
-/* ---------- progress (this device only) ---------- */
-const STORE = "igcse-progskills-v1";
+/* ---------- progress (this browser; synced to the student's account by cloud.js when signed in) ---------- */
+const STORE = CLOUD.storeKey();     // one local copy per account, so students sharing a computer never mix
 const object = v => v && typeof v==="object" && !Array.isArray(v) ? v : {};
 const count = (v,max=100000) => Number.isSafeInteger(v) && v>=0 ? Math.min(v,max) : 0;
 function cleanProgress(raw){
@@ -5438,7 +5782,8 @@ function storageNotice(){
   const el=document.getElementById("savewarning");
   if(el) el.hidden=!storageFailed;
 }
-function save(){
+function save(){ saveLocal(); CLOUD.queue(); }
+function saveLocal(){
   if(TEACHER) return;
   try {
     mergeProgress(readProgress());
@@ -5549,11 +5894,12 @@ function renderHome(){
         ${current?`<a class="btn primary big wide" href="#${current}/${firstOpenStage(current)}">${skillPct(current)?"Continue":"Start"}: Skill ${SKILLS[current].n} →</a>`:""}
       </div>
     </section>
+    ${!TEACHER && !CLOUD.signedIn() ? `<p class="note signin-note">💾 Your progress is only saved on this computer. <button class="btn small primary" type="button" data-signin>Sign in</button> with the username your teacher gave you to save it to your account and carry on from any computer.</p>` : ""}
     <div class="worlds">${worlds}</div>
     <div class="homeend"><section class="panel"><h2>🏅 Badges</h2>${badgeShelf()}</section>
     <section class="panel"><h2>📤 Share your progress</h2>
-      <p class="muted">Your progress is saved in this browser on this device only. To show your teacher, copy a summary and paste it into Teams.</p>
-      <div class="row"><input type="text" id="who" placeholder="Your name and class" style="min-width:220px"><button class="btn primary" id="copysum">Copy my progress</button><span class="status" id="sumst"></span></div>
+      <p class="muted">${CLOUD.signedIn() ? `Your progress is saved to your account (<b>${esc(CLOUD.username())}</b>), so you can carry on from any computer.` : "Your progress is saved in this browser on this computer only."} To show your teacher, copy a summary and paste it into Teams.</p>
+      <div class="row"><input type="text" id="who" placeholder="Your name and class" style="min-width:220px" value="${esc(CLOUD.signedIn() ? CLOUD.who() : "")}"><button class="btn primary" id="copysum">Copy my progress</button><span class="status" id="sumst"></span></div>
       ${TEACHER?`<p class="tmode">Teacher mode: every skill and stage is unlocked in this tab.</p>`:""}
     </section></div>`;
   document.querySelectorAll(".node.locked").forEach(b=>b.onclick=()=>toast(`🔒 ${b.dataset.lock}`,"lock"));
@@ -6268,6 +6614,7 @@ function initTheme(){
 initTheme();
 
 route();
+CLOUD.start();
 
 document.getElementById("previewnotice").hidden = !TEACHER;
 </script>
