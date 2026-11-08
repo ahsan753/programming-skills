@@ -440,6 +440,25 @@ input[type=password]:focus{outline:none;border-color:var(--violet);box-shadow:0 
   .themebtn{width:36px;height:36px}
 }
 
+/* ---------- skip-ahead challenges ---------- */
+.fastbtn{background:var(--paper);border-color:var(--c);color:var(--cd);box-shadow:0 2px 0 var(--cd)}
+.whead .fastbtn,.whead .fasttag{margin-left:4px}
+.fasttag{font-weight:900;font-size:.8rem;color:var(--cd);background:var(--paper);border:2px solid var(--c);border-radius:99px;padding:2px 10px}
+.fastlist{list-style:none;padding:0;margin:8px 0 12px;display:grid;gap:8px}
+.fastlist li{background:var(--wash);border-radius:12px;padding:8px 12px;font-weight:600}
+.fastchips{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 14px}
+.fastchips .chip{font-size:.8rem;font-weight:800;background:var(--violet-w);color:var(--violet-d);border-radius:99px;padding:3px 10px}
+.fastresult{text-align:center}
+.fastresult .tablewrap{max-width:560px;margin:10px auto;text-align:left}
+.fastresult.fr-pass{border-color:var(--green)}
+.fastresult.fr-fail{border-color:var(--orange)}
+.fastscore{font-size:1.6rem;font-weight:900;color:var(--ink)}
+.fasttable td:last-child,.fasttable th:last-child{text-align:right;white-space:nowrap}
+.fasttable tr.zero td{color:var(--red-d);font-weight:800}
+.fastend{text-align:center}
+.testednote{display:inline-block;background:rgba(255,255,255,.18);border-radius:12px;padding:6px 12px;font-weight:800;margin-top:6px}
+@media (max-width:560px){.whead .fastbtn{margin-left:0}}
+
 </style>
 </head>
 <body>
@@ -5267,6 +5286,7 @@ function xpTotal(){
     s.apply.forEach(a=>{ const r=p.apply[a.id]; if (r && Number.isInteger(r.got) && r.got>=0 && r.got<=a.marks && r.of===a.marks){ xp += r.got*10; if (r.got===a.marks) xp += 30; } });
     s.check.forEach((c,i)=>{ const m=p.check[i]; if (c.type!=="selfmark" && Number.isInteger(m) && m>=0 && m<=c.marks){ xp += m*15; if (m===c.marks) xp += 10; } });
   });
+  xp += fastWorlds().filter(gr=>fastPassed(gr.g)).length * FAST_XP;   // skip-ahead challenges passed
   return xp;
 }
 function levelOf(xp){
@@ -5302,7 +5322,9 @@ const BADGES = [
   {id:"exam-ready", icon:"🎓", name:"Exam ready", desc:"Full marks on a Checkpoint question",
    test:()=>liveSkills().some(id=>SKILLS[id].check.some((c,i)=>c.type!=="selfmark" && P(id).check[i]===c.marks))},
   {id:"skill-master", icon:"🏆", name:"Skill master", desc:"Complete all four stages of a skill",
-   test:()=>liveSkills().some(id=>STAGES.every(st=>stageDone(id,st.id)))}
+   test:()=>liveSkills().some(id=>STAGES.every(st=>stageDone(id,st.id)))},
+  {id:"fast-track", icon:"🚀", name:"Fast track", desc:"Pass a skip-ahead challenge",
+   test:()=>fastWorlds().some(gr=>fastPassed(gr.g))}
 ];
 function checkBadges(){
   if (TEACHER) return [];
@@ -5317,7 +5339,7 @@ function checkBadges(){
 const TEACHER = new URLSearchParams(location.search).has("teacher");
 function applyReady(id){ return SKILLS[id].apply.every(a=>{ const r=P(id).apply[a.id]; return r && r.got/r.of>=0.6; }); }
 function stageLock(id, st){
-  if (TEACHER || st==="learn") return null;
+  if (TEACHER || st==="learn" || testedOut(id)) return null;   // tested-out skills are fully open
   if (st==="practise" && !stageDone(id,"learn")) return "Finish Learn to unlock Practise";
   if (st==="apply" && !stageDone(id,"practise")) return "Get every Practise question right to unlock Apply";
   if (st==="check" && !applyReady(id)) return "Reach 'Nearly there' or better on every Apply task to unlock the Checkpoint";
@@ -5328,7 +5350,7 @@ function skillLock(id){
   const L=liveSkills(), i=L.indexOf(id);
   if (i<=0) return null;
   const prev=L[i-1];
-  return stageDone(prev,"check") ? null : `Finish the Skill ${SKILLS[prev].n} Checkpoint to unlock`;
+  return (stageDone(prev,"check") || testedOut(prev)) ? null : `Finish the Skill ${SKILLS[prev].n} Checkpoint to unlock`;
 }
 
 /* ---------- HUD, toasts, confetti, modal ---------- */
@@ -5732,6 +5754,277 @@ const CLOUD = (()=>{
 })();
 
 /* ============================================================
+   FAST TRACK — "skip ahead" challenges. A student can open a later
+   world by proving every skill before it: one exam-style question
+   per skill (drawn at random from that skill's Checkpoint bank)
+   plus one Python coding task. Pass: 80% overall AND at least one
+   mark on every skill. Skipped skills become "tested out": open to
+   visit, but their stages only earn XP when actually done. Passing
+   gives +100 XP and the Fast track badge. A failed attempt can be
+   retried after an hour, with a fresh random draw.
+   State lives in PROG._fast, so it saves and syncs like all progress.
+   ============================================================ */
+const FAST_PASS = 0.8, FAST_WAIT = 60*60*1000, FAST_XP = 100, FAST_TRIES = 3;
+
+function worldSkills(gr){ return gr.items.filter(it=>it[3]).map(it=>it[3]); }
+function fastWorlds(){ return SKILL_MAP.filter((gr,i)=>i>0 && worldSkills(gr).length); }
+function fastWorld(w){ return SKILL_MAP.find(gr=>gr.g===w); }
+function fastCovers(w){ const i=SKILL_MAP.findIndex(gr=>gr.g===w); return SKILL_MAP.slice(0,i).flatMap(worldSkills); }
+function fastPassed(w){ return !!(PROG && PROG._fast && PROG._fast[w] && PROG._fast[w].passed); }
+function fastState(w){ const F=PROG._fast||(PROG._fast={}); return F[w]||(F[w]={}); }
+// A skill is "tested out" when a challenge for any later world has been passed.
+function testedOut(id){
+  if (!PROG || !PROG._fast) return false;
+  const gi=SKILL_MAP.findIndex(gr=>gr.items.some(it=>it[3]===id));
+  return SKILL_MAP.some((gr,i)=>i>gi && fastPassed(gr.g));
+}
+function worldLocked(w){ const first=worldSkills(fastWorld(w))[0]; return !!first && !!skillLock(first); }
+function fastWait(w){
+  const s=PROG._fast && PROG._fast[w];
+  return (!s || !s.failedAt || TEACHER) ? 0 : Math.max(0, s.failedAt + FAST_WAIT - Date.now());
+}
+
+/* ---------- the paper: chosen from a seed, so a reload shows the same questions ---------- */
+function fastRng(seed){
+  let a = seed % 4294967296;
+  return ()=>{ a=(a+0x6D2B79F5)>>>0; let t=a; t=Math.imul(t^(t>>>15),t|1); t^=t+Math.imul(t^(t>>>7),t|61); return ((t^(t>>>14))>>>0)/4294967296; };
+}
+function fastPaper(w, seed){
+  const rnd=fastRng(seed), pick=arr=>arr[Math.floor(rnd()*arr.length)];
+  const qs = fastCovers(w).map(id=>{
+    const all = SKILLS[id].check.map((q,i)=>({q,i})).filter(x=>x.q.type!=="selfmark");
+    const multi = all.filter(x=>x.q.type!=="mcq" && x.q.marks>=2);   // prefer questions that give part marks
+    const c = (multi.length?multi:all).length ? pick(multi.length?multi:all) : null;
+    return c && {id, i:c.i, q:c.q};
+  }).filter(Boolean);
+  // The coding task comes from the last two skills of the world just before, which build on everything earlier.
+  const prev = SKILL_MAP[SKILL_MAP.findIndex(gr=>gr.g===w)-1];
+  const tasks = worldSkills(prev).slice(-2).flatMap(id=>SKILLS[id].apply.filter(a=>!a.fix).map(a=>({id,a})));
+  const task = tasks.length ? pick(tasks) : null;
+  return {qs, task, total: qs.reduce((n,x)=>n+x.q.marks,0) + (task?task.a.marks:0)};
+}
+function fastScore(w, paper, cur){
+  const per={};
+  fastCovers(w).forEach(id=>per[id]={got:0,of:0});
+  paper.qs.forEach(x=>{ per[x.id].of+=x.q.marks; per[x.id].got+=cur.q[x.id]||0; });
+  if (paper.task){ per[paper.task.id].of+=paper.task.a.marks; per[paper.task.id].got+=cur.task||0; }
+  const got=Object.values(per).reduce((n,p)=>n+p.got,0), of=paper.total||1;
+  const zero=Object.keys(per).filter(id=>per[id].of>0 && per[id].got===0);
+  return {per, got, of, pct:Math.round(100*got/of), pass: got/of>=FAST_PASS && !zero.length, zero};
+}
+
+/* ---------- saved state: cleaned on load, merged across tabs and computers ---------- */
+function cleanFast(raw){
+  const obj=v=>v&&typeof v==="object"&&!Array.isArray(v)?v:{}, out={};
+  fastWorlds().forEach(gr=>{
+    const o=obj(obj(raw)[gr.g]), s={};
+    if (typeof o.passed==="string" && /^\d{4}-\d{2}-\d{2}$/.test(o.passed)) s.passed=o.passed;
+    if (Number.isInteger(o.best) && o.best>=0 && o.best<=100) s.best=o.best;
+    if (Number.isSafeInteger(o.failedAt) && o.failedAt>0) s.failedAt=o.failedAt;
+    if (Number.isSafeInteger(o.attempts) && o.attempts>0) s.attempts=Math.min(o.attempts,100000);
+    const c=obj(o.cur);
+    if (!s.passed && Number.isSafeInteger(c.seed) && c.seed>0){
+      const paper=fastPaper(gr.g,c.seed), q={};
+      paper.qs.forEach(x=>{ const v=obj(c.q)[x.id]; if (Number.isInteger(v) && v>=0 && v<=x.q.marks) q[x.id]=v; });
+      s.cur={seed:c.seed, q, tries: Number.isSafeInteger(c.tries) && c.tries>0 ? Math.min(c.tries,FAST_TRIES) : 0};
+      if (paper.task && Number.isInteger(c.task) && c.task>=0 && c.task<=paper.task.a.marks) s.cur.task=c.task;
+      if (typeof c.code==="string") s.cur.code=c.code.slice(0,20000);
+    }
+    if (Object.keys(s).length) out[gr.g]=s;
+  });
+  return out;
+}
+function mergeFast(other){
+  const F=PROG._fast||(PROG._fast={});
+  for (const [w,o] of Object.entries(other||{})){
+    const s=F[w]||(F[w]={});
+    if (o.passed && (!s.passed || o.passed<s.passed)) s.passed=o.passed;
+    for (const k of ["best","failedAt","attempts"]) if (o[k]!==undefined) s[k]=Math.max(s[k]||0, o[k]);
+    if (o.cur){
+      if (!s.cur || o.cur.seed>s.cur.seed) s.cur=JSON.parse(JSON.stringify(o.cur));
+      else if (o.cur.seed===s.cur.seed){
+        for (const [k,v] of Object.entries(o.cur.q)) if (s.cur.q[k]===undefined) s.cur.q[k]=v;   // first answer stands
+        if (o.cur.task!==undefined) s.cur.task=Math.max(s.cur.task===undefined?0:s.cur.task, o.cur.task);
+        s.cur.tries=Math.max(s.cur.tries||0, o.cur.tries||0);
+        if (s.cur.code===undefined && o.cur.code!==undefined) s.cur.code=o.cur.code;
+      }
+    }
+    // Passed, or a later finished attempt, ends any older attempt still open elsewhere.
+    if (s.cur && (s.passed || (s.failedAt && s.failedAt>=s.cur.seed))) delete s.cur;
+  }
+}
+
+/* ---------- home page bits ---------- */
+function fastButton(gr){
+  const i=SKILL_MAP.indexOf(gr);
+  if (i<1 || !worldSkills(gr).length) return "";
+  if (fastPassed(gr.g)) return `<span class="fasttag">⚡ Unlocked by challenge</span>`;
+  if (TEACHER) return `<a class="btn small fastbtn" href="#fast/${gr.g}">⚡ Preview skip-ahead challenge</a>`;
+  if (!worldLocked(gr.g)) return "";
+  return `<a class="btn small fastbtn" href="#fast/${gr.g}">⚡ Skip ahead</a>`;
+}
+function fastSummary(){
+  const done=fastWorlds().filter(gr=>fastPassed(gr.g)).map(gr=>`World ${gr.g} (${PROG._fast[gr.g].best}%, ${PROG._fast[gr.g].passed})`);
+  return done.length ? `Skip-ahead challenges passed: ${done.join(", ")}` : "";
+}
+
+/* ---------- the challenge page ---------- */
+function renderFast(w){
+  const gr=fastWorld(w);
+  if (!gr || SKILL_MAP.indexOf(gr)<1 || !worldSkills(gr).length){ history.replaceState(null,"","#"); return renderHome(); }
+  const covers=fastCovers(w);
+  $("#app").innerHTML = `
+    <section class="banner c-${GROUP_COLOUR[w]}">
+      <a class="back" href="#">← All skills</a>
+      <div class="bn">⚡ Skip-ahead challenge</div>
+      <h1>Jump to World ${w}: ${gr.title}</h1>
+      <p>Prove you already know Skills ${SKILLS[covers[0]].n}–${SKILLS[covers[covers.length-1]].n}, and World ${w} opens straight away.</p>
+    </section>
+    <div id="fast"></div>`;
+  paintFast(w);
+}
+function paintFast(w){
+  const el=$("#fast"); if (!el) return;
+  const gr=fastWorld(w), covers=fastCovers(w), S=fastState(w), firstW=worldSkills(gr)[0];
+  const range=`Skills ${SKILLS[covers[0]].n}–${SKILLS[covers[covers.length-1]].n}`;
+  if (S.passed){
+    el.innerHTML = `<section class="panel fastresult fr-pass"><div class="mbig">⚡</div><h2>You passed this challenge</h2>
+      <p>You scored ${S.best}% on ${S.passed}. World ${w} is open and ${range} are marked as tested out.</p>
+      <a class="btn primary big" href="#${firstW}/${firstOpenStage(firstW)}">Go to Skill ${SKILLS[firstW].n}: ${SKILLS[firstW].title} →</a></section>`;
+    return;
+  }
+  if (!TEACHER && !worldLocked(w)){
+    el.innerHTML = `<section class="panel fastresult"><div class="mbig">🔓</div><h2>World ${w} is already open</h2>
+      <p>You've unlocked it by working through the skills, so there's no need to take the challenge.</p>
+      <a class="btn primary big" href="#${firstW}/${firstOpenStage(firstW)}">Go to Skill ${SKILLS[firstW].n} →</a></section>`;
+    return;
+  }
+  if (S.cur) return paintFastPaper(w);
+  const wait=fastWait(w), mins=Math.ceil(wait/60000);
+  const sample=fastPaper(w,1);
+  el.innerHTML = `<section class="panel fastrules">
+      <h2>How it works</h2>
+      <ul class="fastlist">
+        <li>📝 <b>${sample.qs.length} exam-style questions</b>, one on each of ${range}, chosen at random.</li>
+        <li>💻 <b>One Python coding task.</b> You can check it up to ${FAST_TRIES} times, and your best score counts.</li>
+        <li>☝️ You can answer each question <b>once</b>. You'll see the feedback straight away.</li>
+        <li>🎯 <b>To pass:</b> ${Math.round(FAST_PASS*100)}% overall, and at least one mark on every skill.</li>
+        <li>⚡ <b>If you pass:</b> World ${w} opens, ${range} are marked “tested out” (you can still visit them, and finishing their stages still earns XP), and you get +${FAST_XP} XP and the Fast track badge.</li>
+        <li>💪 <b>If not:</b> you can try again after an hour, with a new set of questions.</li>
+      </ul>
+      <div class="fastchips">${covers.map(id=>`<span class="chip">${SKILLS[id].n}. ${SKILLS[id].title}</span>`).join("")}</div>
+      ${TEACHER?`<p class="tmode">Teacher preview: nothing you do here is saved.</p>`:""}
+      ${wait>0
+        ? `<p class="note">You can try again in ${mins} minute${mins===1?"":"s"}. Meanwhile, keep working through the skills.</p><button class="btn primary big" disabled>Start the challenge</button>`
+        : `<button class="btn primary big" id="faststart">Start the challenge</button>`}
+      <p class="muted" style="margin-top:10px">You can leave and come back: your answers are saved. The challenge ends only when you press Finish.</p>
+    </section>`;
+  const b=$("#faststart");
+  if (b) b.onclick=()=>{
+    if (fastWait(w)>0) return paintFast(w);
+    S.cur={seed:Date.now(), q:{}, tries:0}; S.attempts=(S.attempts||0)+1; save(); paintFast(w);
+    window.scrollTo(0,0);
+  };
+}
+function fastProgress(paper, cur){
+  const el=$("#fastprog"); if (!el) return;
+  const n=paper.qs.filter(x=>cur.q[x.id]!==undefined).length;
+  el.textContent = `Answered ${n} of ${paper.qs.length} questions · Coding task: ${cur.task!==undefined?`best ${cur.task}/${paper.task.a.marks}`:"not checked yet"}`;
+}
+function paintFastPaper(w){
+  const el=$("#fast"), S=fastState(w), cur=S.cur, paper=fastPaper(w,cur.seed), a=paper.task&&paper.task.a;
+  el.innerHTML = `<section class="panel intro"><h2>⚡ World ${w} challenge</h2><p class="muted" id="fastprog" role="status"></p>
+      <p class="muted">Each question can be answered once. Model answers are hidden during the challenge.</p></section>` +
+    paper.qs.map((x,k)=>`<section class="panel" id="fq${k}"><div class="qhead"><span class="qn">Question ${k+1}</span><span class="src own">Skill ${SKILLS[x.id].n}: ${SKILLS[x.id].title}</span><span class="ref">${x.q.ref}</span><span class="marks">[${x.q.marks}]</span><span class="tick"></span></div>
+      <div class="split qsplit"><div class="qside"><div style="margin-top:6px">${x.q.prompt}</div>${x.q.code?codeFig(x.q.code,"pc",{numbered:true}):""}</div><div class="qbody"></div></div></section>`).join("") +
+    (a ? `<section class="panel task" id="fasttask">
+      <div class="taskhead"><span class="kicker">Coding task</span><span class="ctx">Skill ${SKILLS[paper.task.id].n}: ${SKILLS[paper.task.id].title}</span><span class="best"></span></div><h2>${a.title} <span class="marks">[${a.marks}]</span></h2>
+      <div class="split tsplit"><div class="tbrief"><div class="brief">${a.brief}</div><div class="lbl">Example run</div>${termHTML(a.example)}
+        <p class="muted">Write and test it in your own editor, then paste it here. Python errors and time-outs don't use up a check.</p></div>
+      <div class="twork"><div class="lbl" style="margin-top:0">Your Python code</div>
+        <textarea class="codein" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="Paste your program here"></textarea>
+        <div class="row actions"><button class="btn go big chk">▶ Check my code</button><span class="status"></span></div>
+        <div class="result"></div></div></div></section>` : "") +
+    `<section class="panel fastend"><button class="btn primary big" id="fastfinish">Finish and see my result</button></section>`;
+
+  paper.qs.forEach((x,k)=>{
+    const sec=$(`#fq${k}`), box=$(".qbody",sec), tick=$(".tick",sec);
+    const showMark=v=>{ tick.textContent=`Scored ${v}/${x.q.marks}`; tick.className="tick "+(v===x.q.marks?"full":v/x.q.marks>=0.6?"part":"low"); };
+    if (cur.q[x.id]!==undefined){ showMark(cur.q[x.id]); box.innerHTML=`<p class="muted">Answered. Each challenge question can be answered once.</p>`; return; }
+    const record=sc=>{
+      if (cur.q[x.id]!==undefined || !Number.isInteger(sc) || sc<0 || sc>x.q.marks) return;
+      cur.q[x.id]=sc; save(); showMark(sc); fastProgress(paper,cur);
+      setTimeout(()=>box.querySelectorAll("input,textarea,button,select").forEach(e=>e.disabled=true));   // after the renderer shows its feedback
+    };
+    ({mcq:ckMcq, pseudo:ckPseudo, errors:ckErrors, trace:ckTrace, value:ckValue})[x.q.type](x.q, box, record, {choices:{}}, k);
+    box.querySelectorAll(".mdl").forEach(m=>m.style.display="none");
+    box.querySelectorAll("p.muted").forEach(p=>{ if (/change your answer/i.test(p.textContent)) p.remove(); });
+  });
+
+  if (a){
+    const root=$("#fasttask"), ta=$("textarea",root), st=$(".status",root), btn=$(".chk",root);
+    ta.value=cur.code||"";
+    ta.addEventListener("input",()=>{ cur.code=ta.value.slice(0,20000); save(); });
+    ta.addEventListener("keydown",e=>{ if (e.key==="Tab"){ e.preventDefault(); const s=ta.selectionStart; ta.setRangeText("    ", s, ta.selectionEnd, "end"); } });
+    const paintTask=()=>{
+      $(".best",root).innerHTML = cur.task!==undefined ? `Best: <b>${cur.task}/${a.marks}</b>` : "";
+      const left=FAST_TRIES-(cur.tries||0);
+      btn.disabled = left<=0;
+      if (left<=0) st.textContent="No checks left. Your best score counts.";
+      else st.textContent=`${left} check${left===1?"":"s"} left`;
+    };
+    paintTask();
+    btn.onclick=async()=>{
+      if (btn.disabled || (cur.tries||0)>=FAST_TRIES) return;
+      const src=ta.value.replace(/ /g," ").replace(/[“”]/g,'"').replace(/[‘’]/g,"'");
+      if (!src.trim()){ st.textContent="Paste your code first."; return; }
+      if (src.length>20000){ st.textContent="This code is too long. Use fewer than 20,000 characters."; return; }
+      btn.disabled=true; st.textContent = PY.worker ? "Running your code…" : "Loading Python (the first time takes a few seconds)…";
+      let out;
+      try { out = await PY.check(src, a.tests.map(t=>({inputs:t.inputs, overrides:t.overrides||null, rand:t.rand||null}))); }
+      catch(e){ btn.disabled=false; st.textContent=""; $(".result",root).innerHTML=`<div class="errbox"><b>Couldn't load the Python checker.</b><div>Check your internet connection and try again. This didn't use up a check.</div></div>`; return; }
+      let fb;
+      try { fb = feedbackHTML(a, src, out, {apply:{}}); }   // a scratch record: the real skill's progress is never touched
+      catch(e){ btn.disabled=false; st.textContent="The checker could not mark this result. Please try again."; return; }
+      if (!root.isConnected) return;
+      $(".result",root).innerHTML = fb.html;
+      if (fb.got!==undefined){ cur.tries=(cur.tries||0)+1; cur.task=Math.max(cur.task===undefined?0:cur.task, fb.got); save(); fastProgress(paper,cur); }
+      paintTask();
+    };
+    PY.start().catch(()=>{});
+  }
+  fastProgress(paper,cur);
+  $("#fastfinish").onclick=()=>{
+    const left=paper.qs.filter(x=>cur.q[x.id]===undefined).length + (a && cur.task===undefined ? 1 : 0);
+    if (left && !confirm(`You haven't answered ${left} question${left===1?"":"s"} yet (including the coding task if it isn't checked). Unanswered questions score 0. Finish anyway?`)) return;
+    finishFast(w, paper);
+  };
+}
+function finishFast(w, paper){
+  const S=fastState(w), cur=S.cur; if (!cur) return;
+  const r=fastScore(w, paper, cur), b=snap(), gr=fastWorld(w), firstW=worldSkills(gr)[0], covers=fastCovers(w);
+  const range=`Skills ${SKILLS[covers[0]].n}–${SKILLS[covers[covers.length-1]].n}`;
+  S.best=Math.max(S.best||0, r.pct); delete S.cur;
+  if (r.pass) S.passed=new Date().toISOString().slice(0,10); else S.failedAt=Date.now();
+  save();
+  const rows=covers.map(id=>{ const p=r.per[id], ok=p.got>0;
+    return `<tr class="${ok?"":"zero"}"><td>${ok?"✓":"✗"} Skill ${SKILLS[id].n}: ${SKILLS[id].title}</td><td>${p.got} / ${p.of}</td></tr>`; }).join("");
+  const why = r.pass ? "" : [r.pct<FAST_PASS*100?`You need ${Math.round(FAST_PASS*100)}% to pass.`:"", r.zero.length?`You need at least one mark on every skill: ${r.zero.map(id=>"Skill "+SKILLS[id].n).join(", ")} scored 0.`:""].filter(Boolean).join(" ");
+  $("#fast").innerHTML = `<section class="panel fastresult ${r.pass?"fr-pass":"fr-fail"}">
+      <div class="mbig">${r.pass?"⚡":"💪"}</div><h2>${r.pass?`World ${w} is unlocked!`:"Not this time"}</h2>
+      <p class="fastscore">${r.got} / ${r.of} marks (${r.pct}%)</p>
+      ${why?`<p>${why}</p>`:""}
+      <div class="tablewrap"><table class="grid fasttable"><tr><th>Skill</th><th>Marks</th></tr>${rows}</table></div>
+      ${r.pass
+        ? `<p>${range} are marked as tested out. You can still visit them any time, and finishing their stages earns XP.</p><a class="btn primary big" href="#${firstW}/learn">Start Skill ${SKILLS[firstW].n}: ${SKILLS[firstW].title} →</a>`
+        : `<p>You can try again in an hour, with a new set of questions. The skills marked ✗, or with low marks, are the ones to work on first.</p><a class="btn primary big" href="#">Back to all skills</a>`}
+    </section>`;
+  window.scrollTo(0,0);
+  if (r.pass) after(b,{title:`World ${w} unlocked!`, icon:"⚡", sub:`You scored ${r.pct}% and proved ${range}. They're marked as tested out, and you can visit them any time.`});
+  else hud();
+}
+
+/* ============================================================
    APP — routing, rendering, marking helpers, Python runner.
    ============================================================ */
 const $ = (s, el=document) => el.querySelector(s);
@@ -5780,6 +6073,7 @@ function cleanProgress(raw){
   const maxStreak=liveSkills().reduce((n,id)=>n+SKILLS[id].practise.length+SKILLS[id].apply.length+SKILLS[id].check.filter(q=>q.type!=="selfmark").length,0);
   const streak=count(old.streak,maxStreak);
   out._game={streak,best:Math.max(streak,count(old.best,maxStreak)),badges,comeback:old.comeback===true};
+  out._fast=cleanFast(data._fast);
   return out;
 }
 let storageFailed=false;
@@ -5807,6 +6101,7 @@ function mergeProgress(other){
   });
   const G=g(), Q=other._game;
   G.best=Math.max(G.best,Q.best); G.comeback ||= Q.comeback; Object.assign(G.badges,Q.badges);
+  mergeFast(other._fast);
 }
 function storageNotice(){
   const el=document.getElementById("savewarning");
@@ -5879,7 +6174,8 @@ function termHTML(parts){
 function route(){
   document.querySelectorAll(".modal").forEach(m=>{ if(m.dataset.route!==location.hash) m.remove(); });
   const [id, st] = (location.hash.slice(1)||"").split("/");
-  if (Object.hasOwn(SKILLS,id)){
+  if (id==="fast") renderFast(st);
+  else if (Object.hasOwn(SKILLS,id)){
     const lock = skillLock(id);
     if (lock){ toast(`🔒 ${lock}`, "lock"); history.replaceState(null,"","#"); renderHome(); }
     else renderSkill(id, STAGES.some(s=>s.id===st)?st:"learn");
@@ -5897,17 +6193,17 @@ document.addEventListener("click", e=>{
 function renderHome(){
   const xp=xpTotal(), L=levelOf(xp), G=g(), nb=Object.keys(G.badges).length;
   const live=liveSkills();
-  const current = live.find(id=>!skillLock(id) && !stageDone(id,"check")) || [...live].reverse().find(id=>!skillLock(id));
+  const current = live.find(id=>!skillLock(id) && !stageDone(id,"check") && !testedOut(id)) || live.find(id=>!skillLock(id) && !stageDone(id,"check")) || [...live].reverse().find(id=>!skillLock(id));
   const worlds = SKILL_MAP.map(gr=>`
     <section class="world c-${GROUP_COLOUR[gr.g]}">
-      <div class="whead"><span class="wtag">World ${gr.g}</span><h2>${gr.title}</h2><span class="wref">${gr.ref}</span></div>
+      <div class="whead"><span class="wtag">World ${gr.g}</span><h2>${gr.title}</h2><span class="wref">${gr.ref}</span>${fastButton(gr)}</div>
       <div class="path">${gr.items.map(([n,t,ref,id])=>{
         if (!id) return `<div class="node soon"><span class="ring"><span class="nb">${n}</span></span><span class="nt">${t}</span><span class="ns">Coming soon</span></div>`;
         const pct=skillPct(id), lock=skillLock(id), done=STAGES.every(s=>stageDone(id,s.id));
         if (lock) return `<button class="node locked" data-lock="${esc(lock)}"><span class="ring"><span class="nb">🔒</span></span><span class="nt">${t}</span><span class="ns">${n}. Locked</span></button>`;
         return `<a class="node live ${done?"done":""} ${id===current?"current":""}" href="#${id}/${firstOpenStage(id)}" style="--p:${pct}">
           ${id===current?`<span class="go">${pct?"CONTINUE":"START"}</span>`:""}
-          <span class="ring"><span class="nb">${done?"★":n}</span></span><span class="nt">${t}</span><span class="ns">${ref} · ${pct}%</span></a>`;
+          <span class="ring"><span class="nb">${done?"★":n}</span></span><span class="nt">${t}</span><span class="ns">${testedOut(id)&&!done?"⚡ Tested out":`${ref} · ${pct}%`}</span></a>`;
       }).join("")}</div>
     </section>`).join("");
   $("#app").innerHTML = `
@@ -5937,6 +6233,7 @@ function renderHome(){
     const xp=xpTotal(), L=levelOf(xp), G=g(), nb=Object.keys(G.badges).length;
     const who = $("#who").value.trim() || "(no name given)";
     const lines = [`IGCSE CS programming skills: progress for ${who}`, TEACHER?"Teacher preview (not student progress)":"Self-reported browser progress (not teacher-verified)", `Date: ${new Date().toLocaleDateString("en-GB")}`, `Level ${L.n} ${L.title}, ${xp} XP, ${nb} badges, best streak ${G.best}`];
+    if (fastSummary()) lines.push(fastSummary());
     liveSkills().forEach(id=>{
       const s=SKILLS[id], p=P(id);
       const pr = s.practise.filter((_,i)=>p.practise[i]).length;
@@ -5973,6 +6270,7 @@ function renderSkill(id, st){
       <a class="back" href="#">← All skills</a>
       <div class="bn">Skill ${s.n} · <span class="bref">${s.ref}</span></div>
       <h1>${s.title}</h1><p>${s.intro}</p>
+      ${testedOut(id)&&!TEACHER?`<p class="testednote">⚡ Tested out with a skip-ahead challenge. Every stage is open, and finishing them still earns XP.</p>`:""}
       <div class="bprog"><span class="xpbar"><i style="width:${pct}%"></i></span><b>${pct}%</b></div>
     </section>
     <nav class="steps">${steps}</nav>
