@@ -6331,7 +6331,7 @@ function renderPractise(id, el){
 function qClassify(q, box, attempt){
   const sel = {};
   box.innerHTML = `<div class="cls">${q.items.map((it,j)=>`<div class="clsrow" data-j="${j}"><span>${it.code?`<code>${esc(it.t)}</code>`:esc(it.t)}</span>
-    <span class="seg">${q.options.map(o=>`<button data-o="${esc(o)}">${esc(o)}</button>`).join("")}</span><span class="why hidden"></span></div>`).join("")}</div>
+    <span class="seg">${(q.fixedOrder?[...q.options.keys()]:shuffledOrder(q.options.length,"cls|"+(q.title||"")+"|"+q.options.join("|"))).map(k=>q.options[k]).map(o=>`<button data-o="${esc(o)}">${esc(o)}</button>`).join("")}</span><span class="why hidden"></span></div>`).join("")}</div>
     <button class="btn primary">Check answers</button><div class="out"></div>`;
   box.querySelectorAll(".clsrow").forEach(r=>r.querySelectorAll(".seg button").forEach(b=>b.onclick=()=>{
     r.querySelectorAll(".seg button").forEach(x=>x.classList.remove("sel")); b.classList.add("sel"); sel[r.dataset.j]=b.dataset.o;
@@ -6353,12 +6353,24 @@ function qClassify(q, box, attempt){
 }
 // Display order for an MCQ: a fixed shuffle per question (same for every visit), so the right
 // answer isn't always A. Questions whose options are lettered (past papers) or "Line n" keep their order.
-function mcqOrder(q){
-  const n=q.options.length, idx=[...Array(n).keys()];
-  if (q.fixedOrder || q.options.every(o=>/^Line\s+\d/i.test(o.t)) || q.options.every((o,j)=>new RegExp("^"+"ABCDEF"[j]+"\\s").test(o.t))) return idx;
-  let h=2166136261; for (const ch of String(q.prompt||"")+"|"+q.options.map(o=>o.t).join("|")){ h^=ch.charCodeAt(0); h=Math.imul(h,16777619); }
+// A random number kept on this computer: option orders differ between neighbouring screens
+// (so answers can't be copied by position) but stay the same when the page reloads.
+const SHUFFLE_SEED = (()=>{
+  const fresh=()=>1+Math.floor(Math.random()*2147483646);
+  try { let s=Number(localStorage.getItem("ps-shuffle")); if (!Number.isSafeInteger(s) || s<=0){ s=fresh(); localStorage.setItem("ps-shuffle",String(s)); } return s; }
+  catch(e){ return fresh(); }
+})();
+function shuffledOrder(n, key){
+  const idx=[...Array(n).keys()];
+  let h=Math.imul(2166136261^SHUFFLE_SEED,16777619)|1;
+  for (const ch of key){ h^=ch.charCodeAt(0); h=Math.imul(h,16777619); }
   for (let k=n-1;k>0;k--){ h^=h<<13; h^=h>>>17; h^=h<<5; const r=(h>>>0)%(k+1); [idx[k],idx[r]]=[idx[r],idx[k]]; }
   return idx;
+}
+function mcqOrder(q){
+  const n=q.options.length;
+  if (q.fixedOrder || q.options.every(o=>/^Line\s+\d/i.test(o.t)) || q.options.every((o,j)=>new RegExp("^"+"ABCDEF"[j]+"\\s").test(o.t))) return [...Array(n).keys()];
+  return shuffledOrder(n, String(q.prompt||"")+"|"+q.options.map(o=>o.t).join("|"));
 }
 function qMcq(q, box, attempt){
   box.innerHTML = `<div class="opts">${mcqOrder(q).map((j,pos)=>{ const o=q.options[j]; return `<button class="opt ${o.code?"code":""}" data-j="${j}"><span class="ol">${"ABCDEF"[pos]}</span><span class="ot">${esc(o.t)}</span></button>`; }).join("")}</div><div class="out"></div>`;
