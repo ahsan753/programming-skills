@@ -417,7 +417,7 @@ code,pre,kbd,samp,textarea,input,.opt.code .ot,.fields input,table.trace input,.
 .acctbtn.st-saved .dot{background:var(--green)}
 .acctbtn.st-saving .dot,.acctbtn.st-loading .dot{background:var(--amber)}
 .acctbtn.st-offline .dot{background:var(--red)}
-@media (max-width:620px){.acctbtn{padding:0 10px}.acctbtn.out .acctname,.acctbtn.warn .acctname{display:none}.acctbtn.in .acctname{max-width:70px}}
+@media (max-width:620px){.acctbtn{padding:0 10px}.acctbtn.warn .acctname{display:none}.acctbtn.in .acctname{max-width:70px}}
 .acctbox{text-align:left}
 .acctbox h2{text-align:center}
 .acctbox>.btn{margin-top:10px}
@@ -431,7 +431,16 @@ input[type=password]:focus{outline:none;border-color:var(--violet);box-shadow:0 
 .acctform .chk small{display:block;color:var(--ink-2);font-weight:600}
 .acctform .errbox{margin:0}
 .acctbox .small{font-size:.86rem;margin-top:12px}
-.signin-note{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.signin-note{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 14px}
+.signin-note>span{flex:1 1 260px}
+.signin-note .btn.small{padding:7px 16px;font-size:.9rem}
+.soonworld{box-shadow:none;opacity:.85}
+.soonworld .whead{border-bottom:0}
+.soonworld .soontag{margin-left:auto;font-size:.78rem;font-weight:800;color:var(--ink-3);border:2px dashed var(--rule-2);border-radius:999px;padding:2px 10px}
+.soonlist{display:flex;flex-wrap:wrap;gap:6px 8px;margin:0;padding:0 18px 14px;background:var(--cw)}
+.soonlist span{font-size:.82rem;font-weight:700;color:var(--ink-2);background:var(--paper);border:1px solid var(--rule);border-radius:999px;padding:3px 10px}
+.btn.nextlocked{color:var(--ink-2);white-space:normal;text-align:center;cursor:help}
+#nextslot{display:contents}
 .acctbtn[hidden]{display:none}
 .acctbtn .acctico{display:none}
 @media (max-width:420px){
@@ -458,12 +467,18 @@ input[type=password]:focus{outline:none;border-color:var(--violet);box-shadow:0 
 .fastend{text-align:center}
 .testednote{display:inline-block;background:rgba(255,255,255,.18);border-radius:12px;padding:6px 12px;font-weight:800;margin-top:6px}
 @media (max-width:560px){.whead .fastbtn{margin-left:0}}
+.pwrow{display:flex;gap:8px;align-items:center}
+.pwrow input{flex:1;min-width:0}
+.pwrow .pwshow{flex:none;padding:8px 12px;font-size:.85rem}
+/* Very narrow phones: keep the "Sign in" label readable by dropping the level title/bar (the level number stays). */
+@media (max-width:360px){.hud .hudmid{display:none}}
+.tabhint{font-size:.8rem;margin:4px 2px 0}
 
 </style>
 </head>
 <body>
 <header class="top"><div class="wrap"><a class="brand" href="#"><span class="logo">{ }</span><span>Programming Skills<small>Cambridge IGCSE CS 0984</small></span></a><span class="spacer"></span><button id="acctbtn" class="acctbtn out" type="button" aria-label="Sign in to save your progress">👤<span class="acctname"> Sign in</span></button><button id="themebtn" class="themebtn" type="button" aria-label="Switch colour theme" title="Switch between light and dark">🌙</button><div id="hud" class="hud"></div></div></header>
-<div class="wrap"><p id="previewnotice" class="note" hidden>Teacher preview: stages are unlocked. XP, streaks and badges are disabled; student progress is not saved or changed. <a href="?">Return to student mode</a></p><p id="savewarning" class="errbox" role="alert" hidden>Progress could not be saved in this browser. Keep this tab open and copy your progress before leaving.</p></div>
+<div class="wrap"><p id="previewnotice" class="note" hidden>Teacher preview: stages are unlocked. XP, streaks and badges are disabled; student progress is not saved or changed. <a href="?">Return to student mode</a></p><p id="teacherneeded" class="note" hidden>Teacher preview needs a teacher login. <button class="btn small primary" type="button" data-signin>Sign in</button> with your teacher account in this tab and the preview opens.</p><p id="savewarning" class="errbox" role="alert" hidden>Progress could not be saved in this browser. Keep this tab open and copy your progress before leaving.</p></div>
 <main class="wrap" id="app"></main>
 <footer class="wrap foot">Mapped to the Cambridge IGCSE (9–1) Computer Science 0984 syllabus for 2026–2028. Your code is checked in your browser. Progress is saved in this browser and, when you sign in, to your account (including saved code) so you can carry on from any computer.</footer>
 <script type="text/plain" id="harness">
@@ -513,12 +528,17 @@ def validate(tree):
         if ((isinstance(node, ast.Attribute) and _bad_attr(node.attr))
                 or (isinstance(node, ast.Name) and node.id.startswith("__"))):
             raise UnsupportedCode("Python internals are not available in this checker.")
-        # A dunder hidden inside a string literal (e.g. "{0.__globals__}".format(x)) is not an
-        # Attribute node, so it slips past the check above. Reject any string that names one.
+        # str.format can reach attributes from inside the string ("{0.__globals__}".format(x)), which is
+        # not an Attribute node. So .format() is only allowed straight on a string in quotes, where the
+        # check below can read the fields; a format string built while the program runs can't be checked.
+        if (isinstance(node, ast.Attribute) and node.attr == "format"
+                and not (isinstance(node.value, ast.Constant) and isinstance(node.value.value, str))):
+            raise UnsupportedCode("Use .format() straight after a string in quotes, for example \"Total: {}\".format(total), or use an f-string.")
+        # A format field that reads an attribute ("{0.gi_frame}", "{0._f}") or names a dunder.
+        # Ordinary text such as "__________" is fine.
         if isinstance(node, ast.Constant) and isinstance(node.value, str) and (
-                "__" in node.value
-                # str.format attribute access such as "{0.gi_frame}" or "{0._f}"
-                or re.search(r"\{[^{}]*\.[A-Za-z_]", node.value)):
+                re.search(r"\{[^{}]*\.[A-Za-z_]", node.value)
+                or re.search(r"\{[^{}]*__", node.value)):
             raise UnsupportedCode("Python internals are not available in this checker.")
 
 def literal_value(node):
@@ -5336,7 +5356,23 @@ function checkBadges(){
 
 /* ---------- locks ---------- */
 // Public preview is deliberately separate from student progress. A URL is not authentication.
-const TEACHER = new URLSearchParams(location.search).has("teacher");
+// Teacher preview shows model answers, so "?teacher" only works in a tab signed in with a teacher login.
+// The role comes from the sign-in token (app_metadata is set by the teacher tool and students can't change it).
+// Same order as CLOUD's readSession: this tab's session first, then a remembered one.
+const TEACHER_ASKED = new URLSearchParams(location.search).has("teacher");
+function signedInAsTeacher(){
+  for (const name of ["sessionStorage","localStorage"]){
+    try {
+      const s = JSON.parse(window[name].getItem("ps-session"));
+      if (!s || typeof s.access_token!=="string") continue;
+      const part = s.access_token.split(".")[1].replace(/-/g,"+").replace(/_/g,"/");
+      const claims = JSON.parse(atob(part + "===".slice((part.length+3)%4)));
+      return !!(claims && claims.app_metadata && claims.app_metadata.role==="teacher");
+    } catch(e){}
+  }
+  return false;
+}
+const TEACHER = TEACHER_ASKED && signedInAsTeacher();
 function applyReady(id){ return SKILLS[id].apply.every(a=>{ const r=P(id).apply[a.id]; return r && r.got/r.of>=0.6; }); }
 function stageLock(id, st){
   if (TEACHER || st==="learn" || testedOut(id)) return null;   // tested-out skills are fully open
@@ -5377,13 +5413,42 @@ function confetti(n=140){
   let f=0;(function tick(){ ctx.clearRect(0,0,W,Hh); ps.forEach(p=>{ p.vy+=.45; p.vx*=.99; p.x+=p.vx; p.y+=p.vy; p.a+=p.va; ctx.save(); ctx.translate(p.x,p.y); ctx.rotate(p.a); ctx.fillStyle=p.c; ctx.fillRect(-p.r/2,-p.r/4,p.r,p.r/2); ctx.restore(); });
     if (++f<110) requestAnimationFrame(tick); else c.remove(); })();
 }
+/* Code boxes: Tab indents (like a real editor) and Shift+Tab un-indents. Press Esc first and the
+   next Tab moves on to the next control, so keyboard users are never stuck in the box. */
+function codeKeys(ta){
+  let leave=false;
+  ta.addEventListener("keydown", e=>{
+    if (e.key==="Escape"){ leave=true; return; }
+    if (e.key!=="Tab" || leave || e.ctrlKey || e.metaKey || e.altKey){ leave=false; return; }
+    e.preventDefault();
+    const s=ta.selectionStart, end=ta.selectionEnd;
+    if (!e.shiftKey){ ta.setRangeText("    ", s, end, "end"); }
+    else {
+      const ls=ta.value.lastIndexOf("\n", s-1)+1, cut=(ta.value.slice(ls).match(/^ {1,4}/)||[""])[0].length;
+      if (cut){ ta.setRangeText("", ls, ls+cut, "preserve"); ta.selectionStart=ta.selectionEnd=Math.max(ls, s-cut); }
+    }
+    ta.dispatchEvent(new Event("input"));
+  });
+  ta.addEventListener("blur", ()=>{ leave=false; });
+}
 function modal(html){
   const m=document.createElement("div"); m.className="modal";
   m.dataset.route=location.hash;
-  m.innerHTML=`<div class="mbox" role="dialog" aria-modal="true">${html}<button class="btn primary big mclose">Keep going →</button></div>`;
+  const back=document.activeElement;
+  m.innerHTML=`<div class="mbox" role="dialog" aria-modal="true" aria-labelledby="modal-h">${html}<button class="btn primary big mclose">Keep going →</button></div>`;
+  const h=m.querySelector("h2,h3"); if (h) h.id="modal-h"; else m.querySelector(".mbox").setAttribute("aria-label","Well done");
   document.body.appendChild(m);
-  const onKey=e=>{ if(e.key==="Escape") close(); };
-  const close=()=>{ m.remove(); document.removeEventListener("keydown",onKey); };
+  // Escape closes; Tab stays inside the pop-up while it is open.
+  const onKey=e=>{
+    if(e.key==="Escape") return close();
+    if(e.key==="Tab"){ const f=[...m.querySelectorAll("button,a[href],[tabindex]:not([tabindex='-1'])")]; if(!f.length) return;
+      const i=f.indexOf(document.activeElement);
+      if (e.shiftKey && i<=0){ e.preventDefault(); f[f.length-1].focus(); }
+      else if (!e.shiftKey && (i===-1 || i===f.length-1)){ e.preventDefault(); f[0].focus(); } }
+  };
+  const close=()=>{ m.remove(); document.removeEventListener("keydown",onKey);
+    if (back && back.isConnected && back!==document.body) return back.focus({preventScroll:true});
+    const h=document.querySelector("#app h1, #app h2"); if (h){ h.setAttribute("tabindex","-1"); h.focus({preventScroll:true}); } };
   document.addEventListener("keydown",onKey);
   m.querySelector(".mclose").onclick=close; m.onclick=e=>{ if(e.target===m) close(); };
   m.querySelector(".mclose").focus();
@@ -5654,7 +5719,7 @@ const CLOUD = (()=>{
       <p>Use the username and password your teacher gave you. Your progress is then saved to your account, so you can carry on from any computer.</p>
       <form class="acctform" novalidate>
         <label>Username<input type="text" name="u" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="40"></label>
-        <label>Password<input type="password" name="p" autocomplete="current-password" maxlength="72"></label>
+        <label>Password<span class="pwrow"><input type="password" name="p" autocomplete="current-password" maxlength="72"><button class="btn small pwshow" type="button" aria-pressed="false">Show</button></span></label>
         <label class="chk"><input type="checkbox" name="r"><span>Keep me signed in on this computer<small>Only tick this on your own device.</small></span></label>
         <p class="errbox" role="alert" hidden></p>
         <button class="btn primary big wide" type="submit">Sign in</button>
@@ -5664,9 +5729,12 @@ const CLOUD = (()=>{
     const form = m.querySelector("form"), err = m.querySelector(".errbox"), btn = form.querySelector("[type=submit]");
     const fail = msg => { err.textContent = msg; err.hidden = false; btn.disabled = false; btn.textContent = "Sign in"; };
     form.u.focus();
+    const pw = form.querySelector(".pwshow");
+    pw.onclick = () => { const show = form.p.type==="password"; form.p.type = show ? "text" : "password"; pw.textContent = show ? "Hide" : "Show"; pw.setAttribute("aria-pressed", String(show)); };
     form.onsubmit = async e => {
       e.preventDefault();
-      const u = form.u.value.trim().toLowerCase(), p = form.p.value;
+      // Teacher-made passwords never contain spaces, so a space copied by accident is removed.
+      const u = form.u.value.trim().toLowerCase(), p = form.p.value.trim();
       if (!USER.test(u)) return fail("Check your username. It's the one your teacher gave you, for example ali.khan");
       if (!p) return fail("Type your password.");
       btn.disabled = true; btn.textContent = "Signing in…"; err.hidden = true;
@@ -5942,9 +6010,9 @@ function paintFastPaper(w){
       <div class="split tsplit"><div class="tbrief"><div class="brief">${a.brief}</div><div class="lbl">Example run</div>${termHTML(a.example)}
         <p class="muted">Write and test it in your own editor, then paste it here. Python errors and time-outs don't use up a check.</p></div>
       <div class="twork"><div class="lbl" style="margin-top:0">Your Python code</div>
-        <textarea class="codein" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="Paste your program here"></textarea>
+        <textarea class="codein" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="Paste or type your program here"></textarea><p class="tabhint muted">Tab indents. Press Esc, then Tab, to move to the next button.</p>
         <div class="row actions"><button class="btn go big chk">▶ Check my code</button><span class="status"></span></div>
-        <div class="result"></div></div></div></section>` : "") +
+        <div class="result" aria-live="polite"></div></div></div></section>` : "") +
     `<section class="panel fastend"><button class="btn primary big" id="fastfinish">Finish and see my result</button></section>`;
 
   paper.qs.forEach((x,k)=>{
@@ -5965,7 +6033,7 @@ function paintFastPaper(w){
     const root=$("#fasttask"), ta=$("textarea",root), st=$(".status",root), btn=$(".chk",root);
     ta.value=cur.code||"";
     ta.addEventListener("input",()=>{ cur.code=ta.value.slice(0,20000); save(); });
-    ta.addEventListener("keydown",e=>{ if (e.key==="Tab"){ e.preventDefault(); const s=ta.selectionStart; ta.setRangeText("    ", s, ta.selectionEnd, "end"); } });
+    codeKeys(ta);
     const paintTask=()=>{
       $(".best",root).innerHTML = cur.task!==undefined ? `Best: <b>${cur.task}/${a.marks}</b>` : "";
       const left=FAST_TRIES-(cur.tries||0);
@@ -6194,7 +6262,12 @@ function renderHome(){
   const xp=xpTotal(), L=levelOf(xp), G=g(), nb=Object.keys(G.badges).length;
   const live=liveSkills();
   const current = live.find(id=>!skillLock(id) && !stageDone(id,"check") && !testedOut(id)) || live.find(id=>!skillLock(id) && !stageDone(id,"check")) || [...live].reverse().find(id=>!skillLock(id));
-  const worlds = SKILL_MAP.map(gr=>`
+  // Worlds with no live skills yet are shown as one compact row each, so students reach their badges without scrolling past 18 empty circles.
+  const worlds = SKILL_MAP.map(gr=> !gr.items.some(it=>it[3]) ? `
+    <section class="world soonworld c-${GROUP_COLOUR[gr.g]}">
+      <div class="whead"><span class="wtag">World ${gr.g}</span><h2>${gr.title}</h2><span class="soontag">Coming soon</span></div>
+      <p class="soonlist">${gr.items.map(([n,t])=>`<span>${n}. ${t}</span>`).join("")}</p>
+    </section>` : `
     <section class="world c-${GROUP_COLOUR[gr.g]}">
       <div class="whead"><span class="wtag">World ${gr.g}</span><h2>${gr.title}</h2><span class="wref">${gr.ref}</span>${fastButton(gr)}</div>
       <div class="path">${gr.items.map(([n,t,ref,id])=>{
@@ -6220,7 +6293,7 @@ function renderHome(){
         ${current?`<a class="btn primary big wide" href="#${current}/${firstOpenStage(current)}">${skillPct(current)?"Continue":"Start"}: Skill ${SKILLS[current].n} →</a>`:""}
       </div>
     </section>
-    ${!TEACHER && !CLOUD.signedIn() ? `<p class="note signin-note">💾 Your progress is only saved on this computer. <button class="btn small primary" type="button" data-signin>Sign in</button> with the username your teacher gave you to save it to your account and carry on from any computer.</p>` : ""}
+    ${!TEACHER && !CLOUD.signedIn() ? `<p class="note signin-note"><span>💾 <b>Your progress is only saved on this computer.</b> Sign in with the username your teacher gave you to carry on from any computer.</span><button class="btn small primary" type="button" data-signin>Sign in</button></p>` : ""}
     <div class="worlds">${worlds}</div>
     <div class="homeend"><section class="panel"><h2>🏅 Badges</h2>${badgeShelf()}</section>
     <section class="panel"><h2>📤 Share your progress</h2>
@@ -6261,7 +6334,30 @@ function paintSteps(){
   const m=location.hash.match(/^#(s\d+)\/(\w+)/); if(!m||!SKILLS[m[1]]) return;
   const nav=document.querySelector("#app nav.steps"); if(nav) nav.innerHTML=stepsHTML(m[1],m[2]);
   const bp=document.querySelector("#app .bprog"), pct=skillPct(m[1]); if(bp) bp.innerHTML=`<span class="xpbar"><i style="width:${pct}%"></i></span><b>${pct}%</b>`;
+  const ns=document.getElementById("nextslot"); if(ns && STAGES.some(s=>s.id===m[2])) ns.innerHTML=nextHTML(m[1],m[2]);
 }
+// The button at the bottom of a stage. If the next stage is still locked, say what's needed instead of
+// linking to a locked page; after the Checkpoint, go straight on to the next skill when it's open.
+function nextHTML(id, st){
+  const i = STAGES.findIndex(x=>x.id===st);
+  if (i<3){
+    const nx = STAGES[i+1], lock = stageLock(id, nx.id);
+    if (lock) return `<button class="btn big nextlocked" type="button" data-why="${esc(lock)}">🔒 ${nx.name}: ${esc(lock.replace(/ to unlock .*$/,""))}</button>`;
+    return `<a class="btn primary big" href="#${id}/${nx.id}">Next: ${nx.name} →</a>`;
+  }
+  const L = liveSkills(), nid = L[L.indexOf(id)+1];
+  if (nid && !skillLock(nid)) return `<a class="btn primary big" href="#${nid}/${firstOpenStage(nid)}">Next skill: ${SKILLS[nid].title} →</a>`;
+  return `<a class="btn primary big" href="#">Back to all skills</a>`;
+}
+document.addEventListener("click", e=>{
+  const b = e.target.closest(".nextlocked"); if (!b) return;
+  toast(`🔒 ${b.dataset.why}`, "lock");
+  const m = location.hash.match(/^#(s\d+)\/(\w+)/); if (!m || !Object.hasOwn(SKILLS,m[1])) return;
+  let todo = null;
+  if (m[2]==="practise") todo = document.querySelector("#stage .panel.q:not(.solved)");
+  else if (m[2]==="apply"){ const a = SKILLS[m[1]].apply.find(a=>{ const r=P(m[1]).apply[a.id]; return !(r && r.got/r.of>=0.6); }); if (a) todo = document.getElementById(`ap-${a.id}`); }
+  if (todo) todo.scrollIntoView({behavior:"smooth", block:"start"});
+});
 function renderSkill(id, st){
   const s = SKILLS[id], col = GROUP_COLOUR[groupOf(id).g], pct = skillPct(id);
   const steps = stepsHTML(id, st);
@@ -6284,10 +6380,7 @@ function renderSkill(id, st){
   ({learn:renderLearn, practise:renderPractise, apply:renderApply, check:renderCheck})[st](id, el);
   const i = STAGES.findIndex(x=>x.id===st);
   const back = i>0?`<a class="btn" href="#${id}/${STAGES[i-1].id}">← ${STAGES[i-1].name}</a>`:"<span></span>";
-  let next;
-  if (st==="learn") next = `<button class="btn primary big" id="finishlearn">${P(id).learn?"Next: Practise →":"✓ I've finished reading: unlock Practise"}</button>`;
-  else if (i<3) next = `<a class="btn primary big" href="#${id}/${STAGES[i+1].id}">Next: ${STAGES[i+1].name} →</a>`;
-  else next = `<a class="btn primary big" href="#">Back to all skills</a>`;
+  const next = st==="learn" ? `<button class="btn primary big" id="finishlearn">${P(id).learn?"Next: Practise →":"✓ I've finished reading: unlock Practise"}</button>` : `<span id="nextslot">${nextHTML(id, st)}</span>`;
   el.insertAdjacentHTML("beforeend", `<div class="navrow">${back}${next}</div>`);
   if (st==="learn") $("#finishlearn").onclick = ()=>{
     const p=P(id);
@@ -6332,7 +6425,7 @@ function qClassify(q, box, attempt){
   const sel = {};
   box.innerHTML = `<div class="cls">${q.items.map((it,j)=>`<div class="clsrow" data-j="${j}"><span>${it.code?`<code>${esc(it.t)}</code>`:esc(it.t)}</span>
     <span class="seg">${(q.fixedOrder?[...q.options.keys()]:shuffledOrder(q.options.length,"cls|"+(q.title||"")+"|"+q.options.join("|"))).map(k=>q.options[k]).map(o=>`<button data-o="${esc(o)}">${esc(o)}</button>`).join("")}</span><span class="why hidden"></span></div>`).join("")}</div>
-    <button class="btn primary">Check answers</button><div class="out"></div>`;
+    <button class="btn primary">Check answers</button><div class="out" aria-live="polite"></div>`;
   box.querySelectorAll(".clsrow").forEach(r=>r.querySelectorAll(".seg button").forEach(b=>b.onclick=()=>{
     r.querySelectorAll(".seg button").forEach(x=>x.classList.remove("sel")); b.classList.add("sel"); sel[r.dataset.j]=b.dataset.o;
     r.classList.remove("right","wrong"); r.querySelector(".why").classList.add("hidden");
@@ -6373,7 +6466,7 @@ function mcqOrder(q){
   return shuffledOrder(n, String(q.prompt||"")+"|"+q.options.map(o=>o.t).join("|"));
 }
 function qMcq(q, box, attempt){
-  box.innerHTML = `<div class="opts">${mcqOrder(q).map((j,pos)=>{ const o=q.options[j]; return `<button class="opt ${o.code?"code":""}" data-j="${j}"><span class="ol">${"ABCDEF"[pos]}</span><span class="ot">${esc(o.t)}</span></button>`; }).join("")}</div><div class="out"></div>`;
+  box.innerHTML = `<div class="opts">${mcqOrder(q).map((j,pos)=>{ const o=q.options[j]; return `<button class="opt ${o.code?"code":""}" data-j="${j}"><span class="ol">${"ABCDEF"[pos]}</span><span class="ot">${esc(o.t)}</span></button>`; }).join("")}</div><div class="out" aria-live="polite"></div>`;
   box.querySelectorAll(".opt").forEach(b=>b.onclick=()=>{
     const o = q.options[b.dataset.j];
     box.querySelectorAll(".opt").forEach(x=>x.classList.remove("right","wrong"));
@@ -6402,7 +6495,7 @@ function answerMatch(v, a, exact){
 }
 function qValue(q, box, attempt){
   box.innerHTML = `<div class="fields ${q.wide?"wide":""}">${q.fields.map((f,j)=>`<label>${esc(f.label)}<input type="text" data-j="${j}" autocomplete="off" spellcheck="false"></label>`).join("")}</div>
-    <button class="btn primary">Check</button><div class="out"></div>`;
+    <button class="btn primary">Check</button><div class="out" aria-live="polite"></div>`;
   const ins = [...box.querySelectorAll("input")];
   ins.forEach(i=>i.addEventListener("keydown",e=>{ if(e.key==="Enter") box.querySelector(".btn").click(); }));
   box.querySelector(".btn").onclick = ()=>{
@@ -6668,10 +6761,10 @@ function renderApply(id, el){
     ${a.hints.map((h,j)=>`<details class="hint"><summary>💡 Hint ${j+1}</summary><p>${h}</p></details>`).join("")}
     </div><div class="twork">
     <div class="lbl" style="margin-top:0">Your Python code</div>
-    <textarea class="codein" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="Paste your program here"></textarea>
+    <textarea class="codein" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="Paste or type your program here"></textarea><p class="tabhint muted">Tab indents. Press Esc, then Tab, to move to the next button.</p>
     <div class="row actions"><button class="btn go big chk">▶ Check my code</button><button class="btn mdl"></button><span class="status"></span></div>
     <div class="model"></div>
-    <div class="result"></div></div></div></section>`).join("");
+    <div class="result" aria-live="polite"></div></div></div></section>`).join("");
   s.apply.forEach(a=>wireApply(id, a));
   PY.start().catch(()=>{});
 }
@@ -6679,7 +6772,7 @@ function wireApply(id, a){
   const root = $(`#ap-${a.id}`), ta = $("textarea",root), st = $(".status",root), p = P(id);
   ta.value = p.drafts[a.id] || "";
   ta.addEventListener("input", ()=>{ p.drafts[a.id]=ta.value; p.draftAt[a.id]=Date.now(); save(); });
-  ta.addEventListener("keydown", e=>{ if (e.key==="Tab"){ e.preventDefault(); const s=ta.selectionStart; ta.setRangeText("    ", s, ta.selectionEnd, "end"); } });
+  codeKeys(ta);
   const mdl = $(".mdl",root), box = $(".model",root);
   const showBest = ()=>{ const r=p.apply[a.id]; $(".best",root).innerHTML = r ? `Best: <b>${r.got}/${r.of}</b>${r.got===r.of?" ⭐":""}` : ""; };
   const modelOpen = ()=>!!box.innerHTML;
@@ -6806,7 +6899,7 @@ function renderCheck(id, el){
 }
 function ckValue(q, box, record){
   box.innerHTML = `<div class="fields ${q.wide?"wide":""}">${q.fields.map((f,j)=>`<label>${esc(f.label)}<input type="text" data-j="${j}" autocomplete="off" spellcheck="false"></label>`).join("")}</div>
-    <button class="btn go chk">Mark my answer</button><div class="result"></div>`;
+    <button class="btn go chk">Mark my answer</button><div class="result" aria-live="polite"></div>`;
   const ins=[...box.querySelectorAll("input")];
   $(".chk",box).onclick = ()=>{
     let got=0; const rows=q.fields.map((f,j)=>{
@@ -6850,7 +6943,7 @@ function ckSelf(q, box, record){
 }
 function ckPseudo(q, box, record){
   box.innerHTML = `<textarea class="codein" style="min-height:140px" spellcheck="false" placeholder="${esc(q.placeholder)}"></textarea>
-    <div class="row" style="margin-top:8px"><button class="btn go chk">Mark my answer</button><button class="btn mdl" disabled>🔒 Model answer unlocks after you've been marked</button></div><div class="model"></div><div class="result"></div>`;
+    <div class="row" style="margin-top:8px"><button class="btn go chk">Mark my answer</button><button class="btn mdl" disabled>🔒 Model answer unlocks after you've been marked</button></div><div class="model"></div><div class="result" aria-live="polite"></div>`;
   $(".chk",box).onclick = ()=>{
     const L = pcLines($("textarea",box).value);
     if (!L.length) return;
@@ -6871,7 +6964,7 @@ function ckPseudo(q, box, record){
 }
 function ckErrors(q, box, record){
   box.innerHTML = q.errors.map((_,j)=>`<div class="fields wide"><label style="max-width:110px">Error ${j+1}: line<input type="text" class="ln" placeholder="e.g. 3" style="min-width:60px;width:80px"></label><label style="flex:1">Correction<input type="text" class="fx" style="width:100%"></label></div>`).join("") +
-    `<button class="btn go chk">Mark my answer</button><div class="result"></div>`;
+    `<button class="btn go chk">Mark my answer</button><div class="result" aria-live="polite"></div>`;
   $(".chk",box).onclick = ()=>{
     const lns=[...box.querySelectorAll(".ln")].map(x=>{ const m=x.value.trim().match(/^(?:line\s*)?(\d+)\.?$/i); return m?Number(m[1]):NaN; }), fxs=[...box.querySelectorAll(".fx")].map(x=>normTxt(x.value).replace(/<--?/g,"←").replace(/;\s*$/,""));
     const used=new Set(), pts=[];
@@ -6897,7 +6990,7 @@ function ckTrace(q, box, record){
   const isGiven=(r,c)=>q.given.some(([gr,gc])=>gr===r&&gc===c);
   box.innerHTML = `<div class="tablewrap"><table class="grid trace"><tr>${q.cols.map(c=>`<th>${esc(c)}</th>`).join("")}</tr>
     ${q.rows.map((row,r)=>`<tr>${row.map((v,c)=>isGiven(r,c)?`<td>${esc(v)}</td>`:`<td data-r="${r}" data-c="${c}"><input type="text" spellcheck="false" autocomplete="off"></td>`).join("")}</tr>`).join("")}</table></div>
-    <button class="btn go chk" style="margin-top:8px">Mark my table</button><div class="result"></div>`;
+    <button class="btn go chk" style="margin-top:8px">Mark my table</button><div class="result" aria-live="polite"></div>`;
   $(".chk",box).onclick = ()=>{
     const norm = s=>normTxt(s).replace(/\s+/g," ").toLowerCase();
     const quotes=[], cell=(r,c)=>{ const td=box.querySelector(`td[data-r="${r}"][data-c="${c}"]`); return td?td.querySelector("input").value:q.rows[r][c]; };
@@ -6957,6 +7050,7 @@ route();
 CLOUD.start();
 
 document.getElementById("previewnotice").hidden = !TEACHER;
+document.getElementById("teacherneeded").hidden = !(TEACHER_ASKED && !TEACHER);
 </script>
 </body>
 </html>
