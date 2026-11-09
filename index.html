@@ -361,7 +361,6 @@ canvas.confetti{position:fixed;inset:0;pointer-events:none;z-index:80}
 .prose{max-width:78ch}
 @media (min-width:1100px){
   .worlds{grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}
-  .homeend{grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);align-items:start}
   .hero{grid-template-columns:minmax(0,1.6fr) minmax(360px,1fr)}
   .split{display:grid;gap:28px;align-items:start}
   .learnp.split{grid-template-columns:minmax(0,1fr) minmax(0,1.35fr)}
@@ -5931,10 +5930,6 @@ function fastButton(gr){
   if (!worldLocked(gr.g)) return "";
   return `<a class="btn small fastbtn" href="#fast/${gr.g}">⚡ Skip ahead</a>`;
 }
-function fastSummary(){
-  const done=fastWorlds().filter(gr=>fastPassed(gr.g)).map(gr=>`World ${gr.g} (${PROG._fast[gr.g].best}%, ${PROG._fast[gr.g].passed})`);
-  return done.length ? `Skip-ahead challenges passed: ${done.join(", ")}` : "";
-}
 
 /* ---------- the challenge page ---------- */
 function renderFast(w){
@@ -6296,28 +6291,8 @@ function renderHome(){
     ${!TEACHER && !CLOUD.signedIn() ? `<p class="note signin-note"><span>💾 <b>Your progress is only saved on this computer.</b> Sign in with the username your teacher gave you to carry on from any computer.</span><button class="btn small primary" type="button" data-signin>Sign in</button></p>` : ""}
     <div class="worlds">${worlds}</div>
     <div class="homeend"><section class="panel"><h2>🏅 Badges</h2>${badgeShelf()}</section>
-    <section class="panel"><h2>📤 Share your progress</h2>
-      <p class="muted">${CLOUD.signedIn() ? `Your progress is saved to your account (<b>${esc(CLOUD.username())}</b>), so you can carry on from any computer.` : "Your progress is saved in this browser on this computer only."} To show your teacher, copy a summary and paste it into Teams.</p>
-      <div class="row"><input type="text" id="who" placeholder="Your name and class" style="min-width:220px" value="${esc(CLOUD.signedIn() ? CLOUD.who() : "")}"><button class="btn primary" id="copysum">Copy my progress</button><span class="status" id="sumst"></span></div>
-      ${TEACHER?`<p class="tmode">Teacher mode: every skill and stage is unlocked in this tab.</p>`:""}
-    </section></div>`;
+    </div>`;
   document.querySelectorAll(".node.locked").forEach(b=>b.onclick=()=>toast(`🔒 ${b.dataset.lock}`,"lock"));
-  $("#copysum").onclick = ()=>{
-    const xp=xpTotal(), L=levelOf(xp), G=g(), nb=Object.keys(G.badges).length;
-    const who = $("#who").value.trim() || "(no name given)";
-    const lines = [`IGCSE CS programming skills: progress for ${who}`, TEACHER?"Teacher preview (not student progress)":"Self-reported browser progress (not teacher-verified)", `Date: ${new Date().toLocaleDateString("en-GB")}`, `Level ${L.n} ${L.title}, ${xp} XP, ${nb} badges, best streak ${G.best}`];
-    if (fastSummary()) lines.push(fastSummary());
-    liveSkills().forEach(id=>{
-      const s=SKILLS[id], p=P(id);
-      const pr = s.practise.filter((_,i)=>p.practise[i]).length;
-      const ap = s.apply.map(a=>p.apply[a.id]?`${a.title} ${p.apply[a.id].got}/${p.apply[a.id].of}`:`${a.title} not attempted`).join("; ");
-      const ck = s.check.map((c,i)=>p.check[i]!==undefined?`${p.check[i]}/${c.marks}${c.type==="selfmark"?" (self-marked)":""}`:"–").join(", ");
-      lines.push(`Skill ${s.n} ${s.title} (${s.ref}): ${skillPct(id)}% | Learn ${p.learn?"done":"not yet"} | Practise ${pr}/${s.practise.length} | Apply: ${ap} | Checkpoint marks: ${ck}`);
-    });
-    const txt = lines.join("\n"), status=$("#sumst");
-    (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject()).then(()=>status.textContent="Copied. Paste it into Teams.")
-      .catch(()=>{ status.innerHTML = `<textarea style="width:100%;min-height:120px">${esc(txt)}</textarea>`; });
-  };
 }
 function firstOpenStage(id){ return (STAGES.find(s=>!stageDone(id,s.id) && !stageLock(id,s.id))||STAGES[0]).id; }
 
