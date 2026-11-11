@@ -548,6 +548,11 @@ figure.code.pc figcaption{background:var(--blue-f);color:var(--on-f)}
 .matchrow select{font:inherit;font-weight:700;color:var(--ink);background:var(--paper);border:2px solid var(--rule-2);border-radius:10px;padding:6px 10px;min-height:40px}
 @media (max-width:620px){.matchrow{grid-template-columns:1fr}}
 
+/* World E: files shown on pseudocode tasks */
+.filebox{margin-top:6px}
+.filehead{font-size:.82rem;font-weight:800;color:var(--ink-2);margin-bottom:2px}
+.filebox .term{margin:0}
+
 </style>
 </head>
 <body>
@@ -806,7 +811,58 @@ def analyse(src):
                     inp["convLater"] = True
                     break
     analyse_subroutines(tree, info, parents)
+    analyse_lists(tree, info, parents)
     return tree, info
+
+def analyse_lists(tree, info, parents):
+    """Arrays (World E): which names hold lists, whether any list holds lists (2D), how they are indexed,
+    and whether input/print happen inside loops."""
+    def is_list(v):
+        if isinstance(v, (ast.List, ast.ListComp)):
+            return True
+        if isinstance(v, ast.BinOp) and isinstance(v.op, ast.Mult) and (is_list(v.left) or is_list(v.right)):
+            return True
+        return is_name_call(v, ("list",))
+    def is_2d(v):
+        if isinstance(v, ast.List):
+            return any(is_list(e) for e in v.elts)
+        if isinstance(v, ast.ListComp):
+            return is_list(v.elt)
+        if isinstance(v, ast.BinOp) and isinstance(v.op, ast.Mult):
+            return is_2d(v.left) or is_2d(v.right)
+        return False
+    names, two = [], []
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None:
+            for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                if isinstance(t, ast.Name) and is_list(n.value):
+                    names.append(t.id)
+                    if is_2d(n.value):
+                        two.append(t.id)
+        # rows appended to a list make it 2D: grid.append([0, 0, 0]) or grid.append(row) where row is a list
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "append"
+                and isinstance(n.func.value, ast.Name) and n.args
+                and (is_list(n.args[0]) or (isinstance(n.args[0], ast.Name) and n.args[0].id in names))):
+            two.append(n.func.value.id)
+    subs, subs2 = set(), set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Subscript):
+            if isinstance(n.value, ast.Name):
+                subs.add(n.value.id)
+            elif isinstance(n.value, ast.Subscript) and isinstance(n.value.value, ast.Name):
+                subs2.add(n.value.value.id)
+    info["listNames"] = sorted(set(names))
+    info["lists2d"] = sorted(set(two))
+    info["subscripts"] = sorted(subs)
+    info["subscripts2"] = sorted(subs2)
+    prints = [n for n in ast.walk(tree) if is_name_call(n, ("print",))]
+    info["printCount"] = len(prints)
+    info["printInLoop"] = any(_in_loop(n, parents) for n in prints)
+    for inp, n in zip(info["inputs"], sorted([n for n in ast.walk(tree) if is_name_call(n, ("input",))], key=lambda c: (c.lineno, c.col_offset))):
+        inp["loopDepth"] = _loop_depth(n, parents)
+        inp["inLoop"] = inp["loopDepth"] > 0
+    info["listLiterals"] = [[e.value for e in n.elts if isinstance(e, ast.Constant)] for n in ast.walk(tree)
+                            if isinstance(n, ast.List) and n.elts and all(isinstance(e, ast.Constant) for e in n.elts)]
 
 _DEF = (ast.FunctionDef, ast.AsyncFunctionDef)
 def _owner(node, parents):
@@ -817,13 +873,17 @@ def _owner(node, parents):
             return p.name
         p = parents.get(p)
     return None
+_LOOPS = (ast.For, ast.While, ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
 def _in_loop(node, parents):
-    p = parents.get(node)
+    return _loop_depth(node, parents) > 0
+def _loop_depth(node, parents):
+    """How many loops (including comprehensions) a node sits inside, within its own function."""
+    n, p = 0, parents.get(node)
     while p is not None and not isinstance(p, _DEF):
-        if isinstance(p, (ast.For, ast.While)):
-            return True
+        if isinstance(p, _LOOPS):
+            n += 1
         p = parents.get(p)
-    return False
+    return n
 
 def analyse_subroutines(tree, info, parents):
     """Procedures and functions (Skills 16-19): what each def takes, gives back and touches, and where it is called."""
@@ -1004,12 +1064,30 @@ def run(tree, info, inputs, overrides, rand=None, calls=None, watch=None):
                 size[0] += len(s)
                 if size[0] > 20000:
                     raise TooMuchOutput()
-                events.append(["out", s])
+                # which print call wrote this, and from which line of the pupil's code
+                events.append(["out", s, printing[0], printing[1]])
             return len(s)
         def flush(self):
             pass
     safe = safe_builtins()
     safe["input"] = fake_input
+    printing = [None, None]       # [call number, source line] of the print call running now
+    ncalls = [0]
+    def traced_print(*args, **kwargs):
+        ncalls[0] += 1
+        line = None
+        try:
+            fr = sys._getframe(1)
+            if fr.f_code.co_filename == "<your code>":
+                line = fr.f_lineno
+        except Exception:
+            pass
+        printing[0], printing[1] = ncalls[0], line
+        try:
+            return print(*args, **kwargs)
+        finally:
+            printing[0] = printing[1] = None
+    safe["print"] = traced_print
     rnd = RandomModule(ScriptedRandom(rand))
     def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
         if name == "random":
@@ -1121,7 +1199,7 @@ const SKILL_MAP = [
     [16,"Procedures","8.1.6","s16"],[17,"Functions","8.1.6","s17"],[18,"Local and global variables","8.1.6(c)","s18"],
     [19,"Maintainable programs","8.1.8","s19"]]},
   {g:"E", title:"Data structures and files", ref:"8.2, 8.3", items:[
-    [20,"1D arrays","8.2"],[21,"2D arrays","8.2"],[22,"File handling","8.3"]]},
+    [20,"1D arrays","8.2","s20"],[21,"2D arrays","8.2","s21"],[22,"File handling","8.3","s22"]]},
   {g:"F", title:"Standard algorithms", ref:"7.4", items:[
     [23,"Totalling","7.4"],[24,"Counting","7.4"],[25,"Maximum, minimum and average","7.4"],
     [26,"Linear search","7.4"],[27,"Bubble sort","7.4"]]},
@@ -7151,6 +7229,1176 @@ OUTPUT TotalCost`,
   ]
 };
 
+/* ------------------------------------------------------------
+   SKILL 20 — 1D ARRAYS (8.2)
+   World E "Data structures and files". Python lists alongside
+   Cambridge ARRAY[1:n]. The big idea is the index: pseudocode
+   arrays usually start at 1, Python lists always start at 0.
+   ------------------------------------------------------------ */
+SKILLS.s20 = {
+  n:20, title:"1D arrays", ref:"8.2",
+  intro:"Store a whole list of values under one name and reach each one by its index. Learn to declare an array, fill it and read it back with a loop, and to handle Python counting from 0.",
+  learn:[
+    {h:"One name, many values", html:`
+      <p>An <b>array</b> stores several values of the <b>same data type</b> under one identifier. Each value is an <b>element</b>, and you reach it by its position, called its <b>index</b>, written in square brackets.</p>
+      <p>In Cambridge pseudocode an array has a fixed length, given when it is declared with a lower and upper bound: <code>DECLARE Scores : ARRAY[1:5] OF INTEGER</code> makes five INTEGER elements, <code>Scores[1]</code> to <code>Scores[5]</code>.</p>
+      <p>Python uses a <b>list</b> for the same job. A list can grow, but in this skill treat it like an array: a fixed number of values of one type.</p>`,
+     py:`scores = [0, 0, 0, 0, 0]     # five elements
+scores[0] = 12               # the first element
+print(scores[0])`,
+     pc:`DECLARE Scores : ARRAY[1:5] OF INTEGER
+Scores[1] ← 12               // the first element
+OUTPUT Scores[1]`},
+
+    {h:"Counting from 1 or from 0", html:`
+      <p>The syllabus says the first index can be <b>zero or one</b>. It's good practice to state the lower bound, and exam questions generally use <b>1</b>.</p>
+      <p>Python lists <b>always</b> start at 0. So in a five-element list the last index is 4, not 5.</p>
+      <div class="tablewrap"><table class="grid">
+        <tr><th>Element</th><th>1st</th><th>2nd</th><th>3rd</th><th>4th</th><th>5th</th></tr>
+        <tr><td>Pseudocode <code>ARRAY[1:5]</code></td><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td></tr>
+        <tr><td>Python list</td><td>0</td><td>1</td><td>2</td><td>3</td><td>4</td></tr>
+      </table></div>
+      <p>When a user types “level 3”, the Python index is <code>3 - 1</code>.</p>`,
+     py:`levels = ["Jungle", "Desert", "Ice", "Volcano", "Space"]
+choice = 3
+print(levels[choice - 1])    # Ice`,
+     pc:`// Levels[1] is "Jungle" … Levels[5] is "Space"
+Choice ← 3
+OUTPUT Levels[Choice]        // Ice`},
+
+    {h:"A variable as the index", html:`
+      <p>The index doesn't have to be a number you type in: it can be a <b>variable</b>. Put the array in a loop and the loop counter visits every element in turn.</p>
+      <p>This is how you fill an array: one element each time round the loop. The Cambridge guide sets every element of an array like this.</p>
+      <p>In Python, <code>append</code> adds a value to the end of a list, so you can start with an empty list and add one value each time round.</p>`,
+     py:`names = []
+for count in range(5):
+    name = input("Please enter a name: ")
+    names.append(name)`,
+     pc:`DECLARE Names : ARRAY[1:5] OF STRING
+FOR Count ← 1 TO 5
+    OUTPUT "Please enter a name"
+    INPUT Names[Count]
+NEXT Count`},
+
+    {h:"Reading the values back out", html:`
+      <p>Another loop reads the array back. Here the loop counter is used twice: as the index, and as the number shown next to each name.</p>
+      <p>Be careful at the ends. In <code>ARRAY[1:5]</code> there is no element 0 or 6, and in a five-element Python list there is no index 5: Python stops with <b>IndexError: list index out of range</b>.</p>`,
+     py:`for index in range(len(names)):
+    print(str(index + 1) + ".", names[index])`,
+     pc:`FOR Count ← 1 TO 5
+    OUTPUT Count, ". ", Names[Count]
+NEXT Count`,
+     after:`<div class="note tip">Python can also loop straight over the values with <code>for name in names:</code>, when you don't need the index.</div>`},
+
+    {h:"What the examiners say", html:`
+      <div class="exam"><h3>Examiner reports</h3>
+        <blockquote>“Candidates also lost marks by not using the required array structure and array indexing.”<cite>June 2022 Paper 21 Q4(a)</cite></blockquote>
+        <blockquote>“Some candidates declared the array as integer instead of real.”<cite>June 2026 Paper 22 Q10</cite></blockquote>
+        <blockquote>“…checking their array using the loop counter as an index, as well as the next element in the array as the loop counter plus one, even though their loop iterated same number of times as there were elements in the array. This would have gone out of bounds.”<cite>June 2026 Paper 22 Q10</cite></blockquote>
+        <p>Three habits: declare the array with its bounds and the right data type; use a <b>variable</b> as the index inside a loop; and check the first and last index so the loop never goes past the end.</p>
+      </div>`}
+  ],
+
+  practise:[
+    {type:"mcq", title:"Declare an array", ref:"8.2.1",
+     prompt:"Which statement declares an array to store the names of 30 students?",
+     options:[
+       {t:"DECLARE StudentNames : ARRAY[1:30] OF STRING", code:true, ok:true, why:"Correct: lower bound, upper bound and data type, as in the syllabus guide."},
+       {t:"DECLARE StudentNames : ARRAY[30] OF STRING", code:true, why:"Give the lower and upper bounds: ARRAY[1:30]."},
+       {t:"DECLARE StudentNames : STRING[1:30]", code:true, why:"The keyword ARRAY is needed: ARRAY[1:30] OF STRING."},
+       {t:"DECLARE StudentNames : ARRAY[1:30] OF INTEGER", code:true, why:"Names are text, so the data type is STRING."}
+     ]},
+    {type:"value", title:"Python indexes", ref:"8.2.2",
+     prompt:"What does each line print?",
+     lang:"py", code:`teams = ["Lions", "Eagles", "Tigers", "Wolves"]
+print(teams[1])
+print(teams[3])
+print(len(teams))`,
+     fields:[{label:"Line 2",a:["Eagles"],exact:true},{label:"Line 3",a:["Wolves"],exact:true},{label:"Line 4",a:["4"]}],
+     why:"Python counts from 0, so <code>teams[1]</code> is the second team, <b>Eagles</b>, and <code>teams[3]</code> is the fourth, <b>Wolves</b>. There are <b>4</b> elements."},
+    {type:"value", title:"A variable index", ref:"8.2.2",
+     prompt:"What are the two values output?",
+     lang:"pc", code:`DECLARE Goals : ARRAY[1:4] OF INTEGER
+Goals[1] ← 2
+Goals[2] ← 0
+Goals[3] ← 3
+Goals[4] ← 5
+Index ← 3
+OUTPUT Goals[Index]
+OUTPUT Goals[Index - 2] + Goals[4]`,
+     fields:[{label:"First output",a:["3"]},{label:"Second output",a:["7"]}],
+     why:"<code>Goals[3]</code> is <b>3</b>. <code>Index - 2</code> is 1, so the second line is Goals[1] + Goals[4] = 2 + 5 = <b>7</b>."},
+    {type:"mcq", title:"The last element", ref:"8.2.3",
+     prompt:"A Python list <code>levels</code> holds 5 level names. Which expression gives the last one?",
+     options:[
+       {t:"levels[4]", code:true, ok:true, why:"Correct. Five elements have indexes 0 to 4."},
+       {t:"levels[5]", code:true, why:"There is no index 5: Python stops with IndexError: list index out of range."},
+       {t:"levels[1]", code:true, why:"That's the second element. Python starts at 0."},
+       {t:"levels(5)", code:true, why:"Round brackets are for calling functions. Lists use square brackets."}
+     ]},
+    {type:"mcq", title:"Why an array?", ref:"8.2.2",
+     prompt:"Why is an array better than five separate variables <code>Name1</code> … <code>Name5</code>?",
+     options:[
+       {t:"One identifier holds them all, and a loop can visit every element using a variable as the index", ok:true, why:"Correct. That's what makes arrays so useful."},
+       {t:"An array can hold values of different data types", why:"All the elements of an array have the same data type."},
+       {t:"Arrays never need to be declared", why:"In pseudocode an array is declared with its bounds and data type."},
+       {t:"Arrays store data permanently, even after the program ends", why:"That's a file (Skill 22). An array is lost when the program ends."}
+     ]},
+    {type:"value", title:"Fill with a loop", ref:"8.2.3",
+     prompt:"What are the two values output?",
+     lang:"pc", code:`DECLARE Squares : ARRAY[1:5] OF INTEGER
+FOR Count ← 1 TO 5
+    Squares[Count] ← Count * Count
+NEXT Count
+OUTPUT Squares[4]
+OUTPUT Squares[2] + Squares[3]`,
+     fields:[{label:"First output",a:["16"]},{label:"Second output",a:["13"]}],
+     why:"Each element holds its index squared: 1, 4, 9, 16, 25. So <code>Squares[4]</code> is <b>16</b>, and 4 + 9 = <b>13</b>."}
+  ],
+
+  apply:[
+    {id:"a1", marks:6, title:"Squad list", context:"Football",
+     brief:`<p>Write a Python program for a five-a-side team:</p>
+      <ul><li>use a <b>loop</b> to ask for the names of <b>5</b> players and store them in a <b>list</b></li>
+      <li>then use another loop to output each player with their shirt number, 1 to 5, in the order they were entered, e.g. <code>1. Ali</code></li>
+      <li>include at least one comment.</li></ul>`,
+     example:[["out","Player name: "],["in","Ali"],["out","Player name: "],["in","Ben"],["out","…\n1. Ali\n2. Ben\n3. Cal\n4. Dan\n5. Eli"]],
+     tests:[
+       {label:"Ali, Ben, Cal, Dan, Eli", kind:"normal", inputs:["Ali","Ben","Cal","Dan","Eli"], expect:"1. Ali, 2. Ben, 3. Cal, 4. Dan, 5. Eli"},
+       {label:"Zara, Mia, Noor, Ivy, Lena", kind:"normal", inputs:["Zara","Mia","Noor","Ivy","Lena"], expect:"1. Zara, 2. Mia, 3. Noor, 4. Ivy, 5. Lena"}
+     ],
+     hints:[
+       "Start with an empty list, <code>squad = []</code>, then <code>squad.append(name)</code> inside a <code>for</code> loop that runs 5 times.",
+       "Only write <code>input()</code> once, inside the loop.",
+       "To output: <code>for index in range(5):</code> then <code>print(str(index + 1) + \".\", squad[index])</code> (Python's first index is 0, so add 1 for the shirt number)."
+     ],
+     model:{py:`# Read five player names into a list, then show the squad
+squad = []
+for count in range(5):
+    name = input("Player name: ")
+    squad.append(name)
+
+for index in range(5):
+    print(str(index + 1) + ".", squad[index])`,
+       pc:`// Read five player names into an array, then show the squad
+DECLARE Squad : ARRAY[1:5] OF STRING
+FOR Count ← 1 TO 5
+    OUTPUT "Player name"
+    INPUT Squad[Count]
+NEXT Count
+FOR Count ← 1 TO 5
+    OUTPUT Count, ". ", Squad[Count]
+NEXT Count`},
+     mark(R){
+       const {info,H}=R, pts=[], runs=R.runs;
+       const readAll=runs.every(r=>!r.error&&r.unusedInputs===0);
+       const names=[["Ali","Ben","Cal","Dan","Eli"],["Zara","Mia","Noor","Ivy","Lena"]];
+       const listed=i=>{ if (runs[i].error) return false; const L=H.ownLines(runs,i).filter(l=>names[i].some(n=>new RegExp("\\b"+n+"\\b").test(l)));
+         return L.length===5&&L.every((l,k)=>new RegExp("\\b"+names[i][k]+"\\b").test(l)&&new RegExp("(^|\\D)"+(k+1)+"(\\D|$)").test(l)&&!/\d/.test(l.replace(String(k+1),""))); };
+       // a list exists and either it is filled in a recognised way, or both squads come back out of it correctly
+       const usesList=(info.listNames||[]).length>0&&((info.methods||[]).some(m=>m==="append"||m==="insert"||m==="extend")||(info.subscripts||[]).some(n=>info.listNames.includes(n))||(listed(0)&&listed(1)));
+       pts.push(usesList&&readAll ? H.yes("Stores the names in a list","8.2.1","The five names are kept in one list.")
+         : H.no("Stores the names in a list","8.2.1", runs[0].error?"The program stopped with an error. See above."
+             : !usesList?"Store the names in a list: start with <code>squad = []</code> and add each name, e.g. <code>squad.append(name)</code>."
+             : "Read all five names."));
+       const oneInput=info.inputs.length===1&&info.inputs[0].inLoop;
+       pts.push(oneInput&&readAll ? H.yes("Reads the five names with a loop","8.2.3","One <code>input()</code> inside a loop that runs 5 times.")
+         : H.no("Reads the five names with a loop","8.2.3", info.inputs.length>1?`You have ${info.inputs.length} <code>input()</code> lines. Use one, inside a loop that runs 5 times.`
+             : !oneInput?"Put the <code>input()</code> inside a <code>for</code> loop that runs 5 times."
+             : "The loop should ask for exactly 5 names."));
+       const ok0=listed(0);
+       pts.push(ok0 ? H.yes("Outputs each name with its shirt number, in order","8.2.3","1. Ali … 5. Eli, in the order they were typed.")
+         : H.no("Outputs each name with its shirt number, in order","8.2.3", runs[0].error?"The program stopped with an error. See above."
+             : H.ownLines(runs,0).some(l=>/\b0\b/.test(l)&&/Ali/.test(l))?"The first player shows as 0. Python's first index is 0, so print <code>index + 1</code> as the shirt number."
+             : "After reading the names, output each one on its own line with its number, e.g. <code>1. Ali</code>, from 1 to 5."));
+       pts.push(ok0&&listed(1) ? H.yes("Works for any five names","8.2.3","A different squad was listed correctly too.")
+         : H.no("Works for any five names","8.2.3", !ok0?"Get the first squad right first (the mark above)."
+             : "For Zara, Mia, Noor, Ivy and Lena your program didn't list them in order. Output the names stored in the list, not fixed text."));
+       // the five numbered lines came from one print statement repeated by a loop (not five prints, or one long print)
+       const loopOut=H.loopPrinted(runs[0], l=>names[0].some(n=>new RegExp("\\b"+n+"\\b").test(l)), 5);
+       pts.push(loopOut&&ok0 ? H.yes("Outputs the list with a loop","8.2.3","A loop reads the list back, so it would work for any length.")
+         : H.no("Outputs the list with a loop","8.2.3", !ok0?"Get the output right first."
+             : "Use a loop to output the names (<code>for index in range(5):</code>), with one print inside it, not five separate print lines or one long one."));
+       pts.push(H.commentPoint(info, H.attempted(pts.slice(0,5))));
+       return pts;
+     }},
+
+    {id:"a2", marks:6, title:"Level select", context:"Gaming",
+     brief:`<p>A game has five levels, stored in this order: <b>Jungle, Desert, Ice, Volcano, Space</b>.</p>
+      <ul><li>Store the five level names in a <b>list</b>.</li>
+      <li>Ask the player for a level number from <b>1 to 5</b> and output it with its name, e.g. <code>Level 3: Ice</code>. Remember Python counts from 0.</li>
+      <li>If the number isn't 1 to 5, output <code>No such level</code>.</li>
+      <li>Include at least one comment.</li></ul>`,
+     example:[["out","Level number: "],["in","3"],["out","Level 3: Ice"]],
+     tests:[
+       {label:"3", kind:"normal", inputs:["3"], expect:"Level 3: Ice"},
+       {label:"1", kind:"extreme", inputs:["1"], expect:"Level 1: Jungle"},
+       {label:"5", kind:"extreme", inputs:["5"], expect:"Level 5: Space"},
+       {label:"0", kind:"abnormal", inputs:["0"], expect:"No such level"},
+       {label:"6", kind:"abnormal", inputs:["6"], expect:"No such level"},
+       {label:"2", kind:"normal", inputs:["2"], expect:"Level 2: Desert"},
+       {label:"4", kind:"normal", inputs:["4"], expect:"Level 4: Volcano"},
+       {label:"7", kind:"abnormal", inputs:["7"], expect:"No such level"},
+       {label:"-1", kind:"abnormal", inputs:["-1"], expect:"No such level"}
+     ],
+     hints:[
+       "<code>levels = [\"Jungle\", \"Desert\", \"Ice\", \"Volcano\", \"Space\"]</code>",
+       "Level 3 is <code>levels[2]</code>, so use <code>levels[number - 1]</code>.",
+       "Check the range first: <code>if number &gt;= 1 and number &lt;= 5:</code>. Careful: in Python <code>levels[-1]</code> is allowed (it's the last element), so 0 won't cause an error by itself."
+     ],
+     model:{py:`# Show the name of the level the player chooses
+levels = ["Jungle", "Desert", "Ice", "Volcano", "Space"]
+number = int(input("Level number: "))
+if number >= 1 and number <= 5:
+    print("Level", str(number) + ":", levels[number - 1])
+else:
+    print("No such level")`,
+       pc:`// Show the name of the level the player chooses
+DECLARE Levels : ARRAY[1:5] OF STRING
+Levels[1] ← "Jungle"
+Levels[2] ← "Desert"
+Levels[3] ← "Ice"
+Levels[4] ← "Volcano"
+Levels[5] ← "Space"
+INPUT Number
+IF Number >= 1 AND Number <= 5
+  THEN
+    OUTPUT "Level ", Number, ": ", Levels[Number]
+  ELSE
+    OUTPUT "No such level"
+ENDIF`},
+     mark(R){
+       const {info,H}=R, pts=[], runs=R.runs;
+       const want=["jungle","desert","ice","volcano","space"];
+       const hasList=(info.listLiterals||[]).some(l=>l.length===5&&l.every((v,k)=>String(v).toLowerCase()===want[k]));
+       pts.push(hasList ? H.yes("Stores the five level names in a list","8.2.1","All five names, in order, in one list.")
+         : H.no("Stores the five level names in a list","8.2.1", (info.listLiterals||[]).some(l=>l.length===5)?"Store the names in this order: Jungle, Desert, Ice, Volcano, Space."
+             : "Put the five names in a list: <code>levels = [\"Jungle\", \"Desert\", \"Ice\", \"Volcano\", \"Space\"]</code>."));
+       const own=i=>runs[i].error?"":H.afterInput(runs[i]);     // only what was printed after the number was typed
+       const shows=(i,nm)=>{ const t=own(i); return new RegExp("\\b"+nm+"\\b","i").test(t)&&want.filter(w=>w!==nm.toLowerCase()).every(w=>!new RegExp("\\b"+w+"\\b","i").test(t))&&!/no such/i.test(t); };
+       const mid=shows(0,"Ice");
+       pts.push(mid ? H.yes("Level 3 is Ice","8.2.2","The number typed in is turned into the right index.")
+         : H.no("Level 3 is Ice","8.2.2", runs[0].error?"The program stopped with an error. See above."
+             : /volcano/i.test(own(0))?"For 3 you showed Volcano, which is one too far. Python counts from 0, so use <code>levels[number - 1]</code>."
+             : "For 3 the output should be <code>Level 3: Ice</code>."));
+       const ends=shows(1,"Jungle")&&shows(2,"Space");
+       const err=runs.slice(1,3).find(r=>r.error);
+       pts.push(ends ? H.yes("Level 1 and level 5 work","8.2.3","The first and last elements are reached without going off the end.")
+         : H.no("Level 1 and level 5 work","8.2.3", err&&err.error.type==="IndexError"?"Level 5 went off the end of the list (IndexError). The last index of a five-element list is 4: use <code>levels[number - 1]</code>."
+             : err?"The program stopped with an error. See above."
+             : "Level 1 should show Jungle and level 5 should show Space."));
+       const rej=i=>!runs[i].error&&/no such level/i.test(own(i))&&!want.some(w=>new RegExp("\\b"+w+"\\b","i").test(own(i)));
+       const rejects=[3,4,7,8].every(rej);
+       const asksAgain=runs.some(r=>r.error&&r.error.type==="TooManyInputs");
+       pts.push(rejects ? H.yes("Rejects 0 and 6","8.2.3","Numbers outside 1 to 5 get <code>No such level</code> (abnormal data).")
+         : H.no("Rejects 0 and 6","8.2.3", asksAgain?"After an invalid number your program asked for another one. This task only needs one number: output <code>No such level</code> and stop."
+             : [/space/i.test(own(3))?"0 showed Space: in Python <code>levels[-1]</code> is the last element, so there was no error to stop it.":"",
+               runs[4].error&&runs[4].error.type==="IndexError"?"6 went off the end of the list (IndexError).":"",
+               rej(3)&&rej(4)&&!(rej(7)&&rej(8))?"0 and 6 are rejected, but 7 or -1 isn't: check the whole range, not just those two numbers.":""].filter(Boolean).concat(["Check <code>number &gt;= 1 and number &lt;= 5</code> before using it as an index, and output <code>No such level</code> otherwise."]).join(" ")));
+       const allFive=mid&&ends&&shows(5,"Desert")&&shows(6,"Volcano");
+       const viaList=allFive&&info.ifCount<=3&&(info.subscripts||[]).some(n=>(info.listNames||[]).includes(n));
+       pts.push(viaList ? H.yes("Uses the list to find every level","8.2.2","All five levels come from the list with an index, not from an if for every level.")
+         : H.no("Uses the list to find every level","8.2.2", !(mid||ends)?"Get the right names showing first."
+             : !allFive?"Levels 2 and 4 didn't show Desert and Volcano. Look up any number in the list with one index, <code>levels[number - 1]</code>."
+             : "Look the name up in the list with an index, <code>levels[number - 1]</code>, instead of an if for each level."));
+       pts.push(H.commentPoint(info, H.attempted(pts.slice(0,5))));
+       return pts;
+     }}
+  ],
+
+  check:[
+    {type:"pseudo", source:"June 2025 Paper 21 Q3", marks:4, ref:"8.2.3",
+     prompt:"The following pseudocode algorithm uses a count-controlled loop to read in 10 names and store them in the array <code>Names[]</code><br>Rewrite the algorithm in pseudocode, using a <b>condition-controlled loop</b> instead of a count-controlled loop.",
+     code:`FOR Count ← 1 TO 10
+    OUTPUT "Please enter a name"
+    INPUT Name
+    Names[Count] ← Name
+NEXT Count`,
+     placeholder:"Count ← ...\nWHILE ...",
+     model:`Count ← 1
+WHILE Count <= 10 DO
+    OUTPUT "Please enter a name"
+    INPUT Name
+    Names[Count] ← Name
+    Count ← Count + 1
+ENDWHILE`,
+     mark(L,H,raw){
+       const pts=[], prog=H.pcParse(raw), M=prog.main;
+       const loopAt=M.findIndex(s=>s.k==="while"||s.k==="repeat"), loop=M[loopAt];
+       const walk=(b,f)=>b.forEach(s=>{ f(s); ["body","then","else"].forEach(k=>s[k]&&walk(s[k],f)); });
+       // Count ← Count + 1 or Count ← 1 + Count
+       const isInc=s=>s.k==="assign"&&!s.idx&&s.e.k==="bin"&&s.e.op==="+"&&[[s.e.a,s.e.b],[s.e.b,s.e.a]].some(([v,c])=>v.k==="var"&&v.name.toLowerCase()===s.name.toLowerCase()&&c.k==="lit"&&c.v===1);
+       let inc=null; if (loop) walk(loop.body,s=>{ if (isInc(s)) inc=s.name; });
+       let init=inc&&M.slice(0,loopAt).some(s=>s.k==="assign"&&!s.idx&&s.name.toLowerCase()===inc.toLowerCase()&&s.e.k==="lit");
+       // A loop that couldn't be read (e.g. no ENDWHILE) still shows its counter set up and stepped in the text
+       if (!loop){ const lines=L.map(l=>l.s), at=lines.findIndex(l=>/^(WHILE|REPEAT)\b/i.test(l));
+         if (at>=0){ const m=lines.slice(at+1).map(l=>l.match(/^(\w+)\s*←\s*(?:\1\s*\+\s*1|1\s*\+\s*\1)$/i)).find(Boolean);
+           if (m){ inc=m[1]; init=lines.slice(0,at).some(l=>new RegExp("^"+m[1]+"\\s*←\\s*\\d+$","i").test(l)); } } }
+       const usesFor=M.some(s=>s.k==="for");
+       pts.push(init ? H.yes("Count initialised outside the loop","8.1.4(c)",`<code>${H.e(inc)}</code> is set before the loop starts.`)
+         : H.no("Count initialised outside the loop","8.1.4(c)", !loop&&!inc?(usesFor?"The question asks for a condition-controlled loop (WHILE or REPEAT), not FOR.":"Use a WHILE … ENDWHILE or REPEAT … UNTIL loop."):"Before the loop, set the counter to its first value, e.g. <code>Count ← 1</code>."));
+       const names=["Ann","Bob","Cai","Dee","Eve","Fay","Gus","Hal","Ivy","Jo","Kit","Lou"];
+       const r=loop?H.pcRun(raw,{inputs:names, arrays:[["Names",[[0,12]],"STRING"]], skipBad:true}):null;
+       const asked=r?r.events.filter(e=>e[0]==="in").length:0;
+       const tenTimes=loop&&!r.error&&asked===10;
+       pts.push(tenTimes ? H.yes("Condition-controlled loop that runs 10 times, correctly closed","8.1.4(c)",`${loop.k==="while"?"WHILE … ENDWHILE":"REPEAT … UNTIL"} runs exactly 10 times.`)
+         : H.no("Condition-controlled loop that runs 10 times, correctly closed","8.1.4(c)", !loop&&prog.bad.length?`Line ${H.e(prog.bad[0].n)}: ${H.e(prog.bad[0].msg)}`
+             : !loop?"Rewrite it with WHILE … ENDWHILE or REPEAT … UNTIL."
+             : r.error?`We ran it and it stopped: ${H.e(r.error)}`
+             : `We ran it and it asked for ${asked} names instead of 10. Check the condition: with Count starting at 1, use <code>WHILE Count &lt;= 10</code> or <code>UNTIL Count &gt; 10</code>.`));
+       pts.push(inc ? H.yes("Count incremented inside the loop","8.1.4(c)",`<code>${H.e(inc)} ← ${H.e(inc)} + 1</code> is inside the loop.`)
+         : H.no("Count incremented inside the loop","8.1.4(c)", !loop&&!prog.bad.length?"Write the loop first.":"A condition-controlled loop doesn't count by itself: add <code>Count ← Count + 1</code> inside it."));
+       const stored=tenTimes&&[1,2,3,4,5,6,7,8,9,10].every(k=>{ const lo=r.cell("Names",1)===names[0]?1:0; return r.cell("Names",k-1+lo)===names[k-1]; });
+       const prompt=tenTimes&&r.out.filter(o=>/name/i.test(o)).length>=10;
+       pts.push(stored&&prompt ? H.yes("Rest of the algorithm correct","8.2.3","Each name is prompted for, input and stored in the next element of Names[].")
+         : H.no("Rest of the algorithm correct","8.2.3", !tenTimes?"Get the loop running 10 times first."
+             : prog.bad.length?`Line ${H.e(prog.bad[0].n)}: ${H.e(prog.bad[0].msg)}`
+             : !prompt?"Keep the prompt: <code>OUTPUT \"Please enter a name\"</code> each time round."
+             : "Store each name in the next element: <code>Names[Count] ← Name</code>, with Count going up by 1 each time."));
+       return pts;
+     }},
+    {type:"errors", source:"June 2025 Paper 22 Q5(a)", marks:5, ref:"8.2 / 7.8",
+     prompt:"This pseudocode algorithm should allow 500 names of people and their heights to be entered and stored in two 1D arrays, <code>Names[]</code> and <code>Heights[]</code>. The name and height of a person are at the same index in both arrays. The heights are totalled and the shortest person is found. At the end it outputs the name and height of the shortest person and the average height of all 500 people.<br>Identify the line numbers of <b>five</b> errors in the pseudocode and suggest a correction for each error.",
+     code:`DECLARE Names : ARRAY[1:500] OF REAL
+DECLARE Heights : ARRAY[1:500] OF REAL
+DECLARE Shortest : REAL
+DECLARE Total : REAL
+DECLARE Counter : INTEGER
+DECLARE Index : INTEGER
+Shortest ← 500
+Index ← 0
+Total ← 100
+FOR Counter ← 1 TO 500
+    INPUT Names[Index]
+    INPUT Heights[Counter]
+    Total ← Counter + Heights[Counter]
+    IF Heights[Counter] < Shortest
+      THEN
+        Shortest ← Heights[Counter]
+        Index ← Counter
+    ENDIF
+NEXT Counter
+OUTPUT "The shortest height is ", Heights
+OUTPUT "The shortest person is ", Names[Index]
+OUTPUT "The average height is ", Total / 500`,
+     errors:[
+       {line:1, test:/^DECLARE\s+Names\s*:\s*ARRAY\s*\[\s*1\s*:\s*500\s*\]\s*OF\s+STRING$/i, fix:"DECLARE Names : ARRAY[1:500] OF STRING", trap:[{re:/OF\s+(TEXT|STR)\b/i,msg:"The pseudocode data type is STRING."}], why:"Names are text, so the array's data type is STRING, not REAL."},
+       {line:9, test:/^Total\s*(←|<-)\s*0$/i, fix:"Total ← 0", trap:[{re:/=/,msg:"Assign with ←, not =."}], why:"A running total must start at 0."},
+       {line:11, test:/^INPUT\s+Names\s*\[\s*Counter\s*\]$/i, fix:"INPUT Names[Counter]", trap:[], why:"The index must be the loop counter, so each name goes in the next element. Index is 0 here."},
+       {line:13, test:/^Total\s*(←|<-)\s*Total\s*\+\s*Heights\s*\[\s*Counter\s*\]$/i, fix:"Total ← Total + Heights[Counter]", trap:[], why:"Totalling adds each height to the running total."},
+       {line:20, test:/^OUTPUT\s+"[^"]*",\s*(Shortest|Heights\s*\[\s*Index\s*\])$/i, fix:"OUTPUT \"The shortest height is \", Shortest", trap:[], why:"Output one value: Shortest (or Heights[Index]), not the whole array."}
+     ]},
+    {type:"pseudo", source:"exam-style", marks:3, ref:"8.2.1, 8.2.3",
+     prompt:"Write pseudocode to declare a 1D array <code>Scores</code> that can store <b>30</b> whole numbers, then use a loop to set every element of the array to 0.",
+     placeholder:"DECLARE Scores : ...\nFOR ...",
+     model:`DECLARE Scores : ARRAY[1:30] OF INTEGER
+FOR Index ← 1 TO 30
+    Scores[Index] ← 0
+NEXT Index`,
+     mark(L,H,raw){
+       const pts=[], prog=H.pcParse(raw), d=prog.main.find(s=>s.k==="declareArr"&&s.names.some(n=>n.toLowerCase()==="scores"));
+       const r=H.pcRun(raw,{}), A=r.globals&&r.globals.scores, dim=A&&A.arr&&A.dims.length===1?A.dims[0]:null;
+       const lo=dim?dim.lo:null, hi=dim?dim.hi:null;
+       const declOk=d&&d.dims.length===1&&d.type==="INTEGER"&&Number.isInteger(lo)&&Number.isInteger(hi)&&hi-lo+1===30;
+       pts.push(declOk ? H.yes("Array declared for 30 integers","8.2.1",`<code>ARRAY[${H.e(lo)}:${H.e(hi)}] OF INTEGER</code> has 30 elements.`)
+         : H.no("Array declared for 30 integers","8.2.1", !d?"Start with <code>DECLARE Scores : ARRAY[1:30] OF INTEGER</code>."
+             : d.type!=="INTEGER"?"Whole numbers are INTEGER."
+             : "The bounds should give 30 elements, e.g. <code>ARRAY[1:30]</code>."));
+       const walk=(b,f)=>b.forEach(s=>{ f(s); ["body","then","else"].forEach(k=>s[k]&&walk(s[k],f)); });
+       let loopIdx=false; prog.main.filter(s=>["for","while","repeat"].includes(s.k)).forEach(l=>walk(l.body,s=>{ if (s.k==="assign"&&s.idx&&s.name.toLowerCase()==="scores"&&s.idx[0].k!=="lit") loopIdx=true; }));
+       const nextOk=!prog.nextErrors.length;
+       pts.push(loopIdx&&nextOk ? H.yes("A loop uses a variable as the index","8.2.2","The loop counter picks each element in turn.")
+         : H.no("A loop uses a variable as the index","8.2.2", !nextOk?`Line ${H.e(prog.nextErrors[0].n)}: ${H.e(prog.nextErrors[0].msg)}`:"Use a loop, with its counter as the index: <code>FOR Index ← 1 TO 30</code> … <code>Scores[Index] ← 0</code> … <code>NEXT Index</code>."));
+       const all=declOk&&!r.error&&[...Array(30).keys()].every(k=>r.cell("Scores",lo+k)===0);
+       pts.push(all ? H.yes("Every element set to 0","8.2.3","We ran it: all 30 elements hold 0.")
+         : H.no("Every element set to 0","8.2.3", !declOk?"Declare the array first."
+             : r.error?`We ran it and it stopped: ${H.e(r.error)}`
+             : "Some elements weren't set to 0. The loop should go from the first index to the last."));
+       return pts;
+     }}
+  ]
+};
+
+/* ------------------------------------------------------------
+   SKILL 21 — 2D ARRAYS (8.2)
+   Rows and columns: ARRAY[1:r, 1:c] and Grid[Row, Column] in
+   pseudocode; a list of lists and grid[row][col] in Python.
+   Nested loops fill and read them.
+   ------------------------------------------------------------ */
+SKILLS.s21 = {
+  n:21, title:"2D arrays", ref:"8.2",
+  intro:"A table of values with rows and columns under one name. Learn to declare a 2D array, reach any element with a row and a column, and use nested loops to fill it and read it back.",
+  learn:[
+    {h:"Rows and columns", html:`
+      <p>A <b>two-dimensional (2D) array</b> is like a table: it has <b>rows</b> and <b>columns</b>, and every element has two indexes.</p>
+      <p>In pseudocode both bounds go in one pair of square brackets: <code>DECLARE NoughtsAndCrosses : ARRAY[1:3, 1:3] OF CHAR</code>. To reach an element, give the <b>row first, then the column</b>: <code>NoughtsAndCrosses[2, 3] ← 'X'</code> puts an X in row 2, column 3.</p>
+      <p>Python uses a <b>list of lists</b>: each row is a list. You write two pairs of brackets, <code>board[row][column]</code>, and both still count from 0.</p>`,
+     py:`board = [["-", "-", "-"],
+         ["-", "-", "-"],
+         ["-", "-", "-"]]
+board[1][2] = "X"        # row 2, column 3`,
+     pc:`DECLARE Board : ARRAY[1:3, 1:3] OF CHAR
+// … every element set to '-' …
+Board[2, 3] ← 'X'        // row 2, column 3`},
+
+    {h:"Nested loops visit every element", html:`
+      <p>To reach every element, put one loop inside another. The <b>outer</b> loop picks a row; the <b>inner</b> loop goes along every column in that row. A 3 × 3 array runs the inner statement 3 × 3 = 9 times.</p>
+      <p>Close the inner loop before the outer one: <code>NEXT Column</code> comes before <code>NEXT Row</code>.</p>`,
+     py:`board = []
+for row in range(3):
+    board.append(["-", "-", "-"])    # a new row each time`,
+     pc:`FOR Row ← 1 TO 3
+    FOR Column ← 1 TO 3
+        Board[Row, Column] ← '-'
+    NEXT Column
+NEXT Row`,
+     after:`<div class="note tip">A Python trap: <code>[["-"] * 3] * 3</code> makes three references to the <b>same</b> row, so changing one square changes a whole column. Build each row separately, as above.</div>`},
+
+    {h:"Reading a table in", html:`
+      <p>The same nested loops can fill a table with input. Here each of two players enters a score for each of three rounds, so 2 × 3 = 6 scores are read.</p>
+      <p>In Python, set up the table first, filled with zeros, then store each value with both indexes.</p>`,
+     py:`scores = [[0, 0, 0], [0, 0, 0]]
+for player in range(2):
+    for game in range(3):
+        scores[player][game] = int(input("Score: "))`,
+     pc:`DECLARE Scores : ARRAY[1:2, 1:3] OF INTEGER
+FOR Player ← 1 TO 2
+    FOR Round ← 1 TO 3
+        INPUT Scores[Player, Round]
+    NEXT Round
+NEXT Player`},
+
+    {h:"Showing one row at a time", html:`
+      <p>To show a table, output one row on each line. In pseudocode, list the elements of the row in one OUTPUT, separated by commas: they appear on the same line.</p>
+      <p>In Python, <code>" ".join(row)</code> joins the strings in a row with spaces, or print with <code>end=" "</code> inside the inner loop.</p>`,
+     py:`for row in board:
+    print(" ".join(row))`,
+     pc:`FOR Row ← 1 TO 3
+    OUTPUT Board[Row, 1], Board[Row, 2], Board[Row, 3]
+NEXT Row`},
+
+    {h:"What the examiners say", html:`
+      <div class="exam"><h3>Examiner reports</h3>
+        <blockquote>“The marks were awarded for correctly completing the parameter name and data type in the procedure header statement, using the parameter as the loop termination variable, correctly storing the input data into the array, and closing the nested loops with NEXT statements.”<cite>November 2025 Paper 22 Q2(b)(i)</cite></blockquote>
+        <blockquote>“Most candidates identified some of the errors… but few identified five.”<cite>November 2025 Paper 22 Q2(a)</cite></blockquote>
+        <p>One of the errors in that question, and again in June 2026, was an <b>array index</b>: a fixed number where the loop variable was needed, such as <code>Contacts[Row, 1]</code> instead of <code>Contacts[Row, Column]</code>. Always ask: which variable should pick the row, and which the column?</p>
+      </div>`}
+  ],
+
+  practise:[
+    {type:"mcq", title:"Declare a 2D array", ref:"8.2.1",
+     prompt:"A league stores the goals scored by 4 teams in each of 6 matches. Which declaration is correct?",
+     options:[
+       {t:"DECLARE Goals : ARRAY[1:4, 1:6] OF INTEGER", code:true, ok:true, why:"Correct: both bounds in one pair of brackets, separated by a comma."},
+       {t:"DECLARE Goals : ARRAY[1:4][1:6] OF INTEGER", code:true, why:"Pseudocode uses one pair of brackets for both dimensions: ARRAY[1:4, 1:6]."},
+       {t:"DECLARE Goals : ARRAY[4, 6] OF INTEGER", code:true, why:"Give the lower and upper bound of each dimension: 1:4 and 1:6."},
+       {t:"DECLARE Goals : ARRAY[1:24] OF INTEGER", code:true, why:"That's a 1D array of 24 elements. A table of teams and matches needs two dimensions."}
+     ]},
+    {type:"value", title:"List of lists", ref:"8.2.2",
+     prompt:"What does each line print?",
+     lang:"py", code:`grid = [[1, 2, 3],
+        [4, 5, 6]]
+print(grid[1][0])
+print(grid[0][2])
+print(len(grid))`,
+     fields:[{label:"Line 3",a:["4"]},{label:"Line 4",a:["3"]},{label:"Line 5",a:["2"]}],
+     why:"<code>grid[1]</code> is the second row, and its first element is <b>4</b>. <code>grid[0][2]</code> is the first row, third column: <b>3</b>. There are <b>2</b> rows."},
+    {type:"value", title:"Trace the nested loops", ref:"8.2.3",
+     prompt:"What are the two values output?",
+     lang:"pc", code:`DECLARE T : ARRAY[1:2, 1:3] OF INTEGER
+FOR Row ← 1 TO 2
+    FOR Column ← 1 TO 3
+        T[Row, Column] ← Row * 10 + Column
+    NEXT Column
+NEXT Row
+OUTPUT T[2, 1]
+OUTPUT T[1, 3]`,
+     fields:[{label:"First output",a:["21"]},{label:"Second output",a:["13"]}],
+     why:"Each element holds row × 10 + column. Row 2, column 1 gives <b>21</b>; row 1, column 3 gives <b>13</b>."},
+    {type:"mcq", title:"How many times?", ref:"8.2.3",
+     prompt:"An outer loop runs <code>FOR Row ← 1 TO 3</code> and an inner loop runs <code>FOR Column ← 1 TO 4</code>. How many times does a statement inside the inner loop run?",
+     options:[
+       {t:"12", ok:true, why:"Correct. The inner loop runs 4 times for each of the 3 rows: 3 × 4 = 12."},
+       {t:"7", why:"That adds the loops. The inner loop runs completely every time the outer loop goes round: 3 × 4."},
+       {t:"4", why:"The inner loop runs 4 times, but it does that once for each of 3 rows."},
+       {t:"3", why:"The outer loop runs 3 times, and each time the inner loop runs 4 times."}
+     ]},
+    {type:"mcq", title:"The Python trap", ref:"8.2.1",
+     prompt:"What does this Python print?",
+     lang:"py", code:`board = [["-"] * 3] * 3
+board[0][0] = "X"
+print(board[1][0])`,
+     options:[
+       {t:"X", ok:true, why:"Correct, surprisingly. * 3 makes three references to the same row, not three separate rows, so changing one changes them all. Build each row separately."},
+       {t:"-", why:"You'd expect that, but all three rows are the same list in memory."},
+       {t:"An IndexError", why:"Index 1 exists: there are three rows. The surprise is that they're all the same row."},
+       {t:"[\"X\", \"-\", \"-\"]", why:"board[1][0] is a single element, not a whole row."}
+     ]},
+    {type:"mcq", title:"Bottom-left", ref:"8.2.2",
+     prompt:"<code>Board</code> is declared as <code>ARRAY[1:3, 1:3] OF CHAR</code>, with row 1 at the top. Which statement puts an <code>'O'</code> in the bottom-left square?",
+     options:[
+       {t:"Board[3, 1] ← 'O'", code:true, ok:true, why:"Correct: row 3 (the bottom), column 1 (the left). Row first, then column."},
+       {t:"Board[1, 3] ← 'O'", code:true, why:"That's row 1, column 3: the top-right square. The row comes first."},
+       {t:"Board[3][1] ← 'O'", code:true, why:"In pseudocode both indexes go in one pair of brackets: Board[3, 1]."},
+       {t:"Board[2, 0] ← 'O'", code:true, why:"Those look like Python's 0-based indexes. This array's bounds start at 1."}
+     ]}
+  ],
+
+  apply:[
+    {id:"a1", marks:6, title:"Noughts and crosses", context:"Gaming",
+     brief:`<p>Write a Python program for the first move of noughts and crosses:</p>
+      <ul><li>make a 3 × 3 board as a <b>list of lists</b>, with <code>-</code> in every square</li>
+      <li>ask for a <b>row</b> (1 to 3) and a <b>column</b> (1 to 3), and put an <code>X</code> in that square</li>
+      <li>use a loop to print the board, one row per line, e.g. <code>-X-</code></li>
+      <li>include at least one comment.</li></ul>
+      <p>Row 1 is the top row and column 1 is the left-hand column.</p>`,
+     example:[["out","Row: "],["in","2"],["out","Column: "],["in","3"],["out","---\n--X\n---"]],
+     tests:[
+       {label:"Row 2, column 2", kind:"normal", inputs:["2","2"], expect:"---\n-X-\n---"},
+       {label:"Row 1, column 3", kind:"extreme", inputs:["1","3"], expect:"--X\n---\n---"},
+       {label:"Row 3, column 1", kind:"extreme", inputs:["3","1"], expect:"---\n---\nX--"}
+     ],
+     hints:[
+       "Build the board row by row: <code>board = []</code>, then three times <code>board.append([\"-\", \"-\", \"-\"])</code> (avoid <code>[[\"-\"] * 3] * 3</code>).",
+       "Python counts from 0: row 2, column 3 is <code>board[1][2]</code>, so use <code>board[row - 1][column - 1] = \"X\"</code>.",
+       "To print: <code>for line in board:</code> then <code>print(\"\".join(line))</code>."
+     ],
+     model:{py:`# First move of noughts and crosses on a 3 x 3 board
+board = []
+for count in range(3):
+    board.append(["-", "-", "-"])
+
+row = int(input("Row: "))
+column = int(input("Column: "))
+board[row - 1][column - 1] = "X"
+
+for line in board:
+    print("".join(line))`,
+       pc:`// First move of noughts and crosses on a 3 x 3 board
+DECLARE Board : ARRAY[1:3, 1:3] OF CHAR
+FOR Row ← 1 TO 3
+    FOR Column ← 1 TO 3
+        Board[Row, Column] ← '-'
+    NEXT Column
+NEXT Row
+INPUT MoveRow
+INPUT MoveColumn
+Board[MoveRow, MoveColumn] ← 'X'
+FOR Row ← 1 TO 3
+    OUTPUT Board[Row, 1], Board[Row, 2], Board[Row, 3]
+NEXT Row`},
+     mark(R){
+       const {info,H}=R, pts=[], runs=R.runs;
+       // the last three printed lines made only of X and - (spaces, commas and brackets ignored)
+       // a board row is a printed line made only of X/- squares plus spacing, brackets, quotes, bars or a row label
+       const isRow=l=>l.replace(/[Xx\-\s|,'"\[\]0-9:.]/g,"")===""&&l.replace(/[^Xx\-]/g,"").length===3;
+       const board=i=>{ if (runs[i].error) return null; const L=H.printed(runs[i]).split("\n").filter(isRow).map(l=>l.replace(/[^Xx\-]/g,""));
+         return L.length>=3?L.slice(-3).map(l=>l.toUpperCase()):null; };
+       const xAt=(b,r,c)=>b&&b[r-1][c-1]==="X";
+       const only=b=>b&&b.join("").replace(/-/g,"")==="X";
+       const two=(info.lists2d||[]).length>0||(info.subscripts2||[]).length>0;
+       const any=[0,1,2].some(i=>board(i));
+       pts.push(two&&any ? H.yes("The board is a list of lists","8.2.1","Each row is a list inside the board list: a 2D array.")
+         : H.no("The board is a list of lists","8.2.1", runs[0].error?"The program stopped with an error. See above."
+             : !two?"Make the board a list of lists, one list per row, and reach a square with <code>board[row][column]</code>."
+             : "Print the board as three rows of three squares, e.g. <code>-X-</code>."));
+       const b0=board(0);
+       pts.push(xAt(b0,2,2) ? H.yes("X goes in the square chosen","8.2.2","Row 2, column 2 put X in the middle.")
+         : H.no("X goes in the square chosen","8.2.2", runs[0].error&&runs[0].error.type==="IndexError"?"An index went off the edge of the board. Python counts from 0, so use <code>board[row - 1][column - 1]</code>."
+             : runs[0].error?"The program stopped with an error. See above."
+             : xAt(b0,3,3)?"For row 2, column 2 the X landed in row 3, column 3. Python counts from 0: subtract 1 from both."
+             : "For row 2, column 2 the X should be in the middle of the board."));
+       const b1=board(1), b2=board(2);
+       const corners=xAt(b1,1,3)&&xAt(b2,3,1)&&only(b1)&&only(b2);
+       pts.push(corners ? H.yes("Row and column the right way round","8.2.2","Row 1, column 3 is top-right and row 3, column 1 is bottom-left.")
+         : H.no("Row and column the right way round","8.2.2", xAt(b1,3,1)?"Row 1, column 3 put the X bottom-left: the row and column are swapped. Use <code>board[row - 1][column - 1]</code>: row first."
+             : runs.slice(1).some(r=>r.error)?"A corner square caused an error. Check both indexes subtract 1."
+             : !only(b1)||!only(b2)?"More than one square changed for the corner moves (see the mark below)."
+             : "Row 1, column 3 should be the top-right square, and row 3, column 1 the bottom-left."));
+       const rest=[b0,b1,b2].every(only);
+       pts.push(rest&&xAt(b0,2,2) ? H.yes("Every other square stays -","8.2.1","Only one square changed.")
+         : H.no("Every other square stays -","8.2.1", !b0?"Print the board first."
+             : "More than one square changed. If a whole column filled with X, your rows are copies of one list: build each row separately with <code>append</code>."));
+       const rows=H.outLines(runs[0]).filter(x=>isRow(x.t)), src=new Set(), calls=new Set(); rows.forEach(x=>{ x.src.forEach(c=>src.add(c)); x.calls.forEach(c=>calls.add(c)); });
+       const looped=rows.length>=3&&calls.size>=3&&src.size<3;
+       pts.push(looped&&any ? H.yes("Prints the board with a loop","8.2.3","A loop prints each row in turn.")
+         : H.no("Prints the board with a loop","8.2.3", !any?"Print the board first.":"Use a loop to print the rows: <code>for line in board:</code>."));
+       pts.push(H.commentPoint(info, H.attempted(pts.slice(0,5))));
+       return pts;
+     }},
+
+    {id:"a2", marks:6, title:"Scoreboard", context:"Sport",
+     brief:`<p>Two players each play <b>3 rounds</b> of a quiz.</p>
+      <ul><li>Use <b>nested loops</b> to read the six scores into a <b>2D list</b>: player 1's three rounds first, then player 2's.</li>
+      <li>Then output each player's scores on one line, e.g. <code>Player 1: 5 7 2</code>.</li>
+      <li>Include at least one comment.</li></ul>`,
+     example:[["out","Player 1, round 1: "],["in","5"],["out","…\nPlayer 1: 5 7 2\nPlayer 2: 8 1 4"]],
+     tests:[
+       {label:"5 7 2 / 8 1 4", kind:"normal", inputs:["5","7","2","8","1","4"], expect:"Player 1: 5 7 2\nPlayer 2: 8 1 4"},
+       {label:"10 0 3 / 6 6 9", kind:"normal", inputs:["10","0","3","6","6","9"], expect:"Player 1: 10 0 3\nPlayer 2: 6 6 9"}
+     ],
+     hints:[
+       "Set up the table first, filled with zeros: <code>scores = [[0, 0, 0], [0, 0, 0]]</code>.",
+       "Outer loop for the player, inner loop for the round: <code>scores[player][game] = int(input(...))</code>.",
+       "To output a row on one line, loop over the player's scores with <code>print(score, end=\" \")</code>, or print the three elements with commas between them: <code>scores[player][0], scores[player][1], scores[player][2]</code>. (<code>join</code> only works on strings, so it fails on a list of whole numbers.)"
+     ],
+     model:{py:`# Read two players' scores for three rounds, then show them
+scores = [[0, 0, 0], [0, 0, 0]]
+for player in range(2):
+    for game in range(3):
+        scores[player][game] = int(input("Player " + str(player + 1) + ", round " + str(game + 1) + ": "))
+
+for player in range(2):
+    print("Player", str(player + 1) + ":", scores[player][0], scores[player][1], scores[player][2])`,
+       pc:`// Read two players' scores for three rounds, then show them
+DECLARE Scores : ARRAY[1:2, 1:3] OF INTEGER
+FOR Player ← 1 TO 2
+    FOR Round ← 1 TO 3
+        INPUT Scores[Player, Round]
+    NEXT Round
+NEXT Player
+FOR Player ← 1 TO 2
+    OUTPUT "Player ", Player, ": ", Scores[Player, 1], " ", Scores[Player, 2], " ", Scores[Player, 3]
+NEXT Player`},
+     mark(R){
+       const {info,H}=R, pts=[], runs=R.runs;
+       const readAll=runs.every(r=>!r.error&&r.unusedInputs===0);
+       const two=(info.lists2d||[]).length>0||(info.subscripts2||[]).length>0;
+       pts.push(two&&readAll ? H.yes("Scores stored in a 2D list","8.2.1","One list per player, one element per round.")
+         : H.no("Scores stored in a 2D list","8.2.1", runs[0].error?"The program stopped with an error. See above."
+             : !two?"Store the scores in a list of lists, e.g. <code>scores = [[0, 0, 0], [0, 0, 0]]</code>, and use <code>scores[player][game]</code>."
+             : "Read all six scores."));
+       const nested=info.inputs.length===1&&(info.inputs[0].loopDepth||0)>=2&&readAll;   // the input itself sits in a loop inside a loop
+       pts.push(nested ? H.yes("Reads the scores with nested loops","8.2.3","An outer loop for each player, an inner loop for each round.")
+         : H.no("Reads the scores with nested loops","8.2.3", info.inputs.length>1?`You have ${info.inputs.length} <code>input()</code> lines. Use one, inside nested loops.`
+             : info.inputs.length===1&&info.inputs[0].inLoop?"Your input is in a single loop. Use nested loops: an outer loop for each player, an inner loop for each round."
+             : "Put one <code>input()</code> inside an inner loop (rounds) inside an outer loop (players)."));
+       const row=(i,p,vals)=>{ if (runs[i].error) return false; const L=H.ownLines(runs,i);
+         const line=L.find(l=>new RegExp("player\\s*"+p+"\\b","i").test(l))||null;
+         if (!line) return false; const n=(line.replace(new RegExp("player\\s*"+p,"i"),"").match(/-?\d+/g)||[]).map(Number);
+         return n.length>=3&&vals.every((x,k)=>n[k]===x); };   // a total or average after the three scores is fine
+       const p1=row(0,1,[5,7,2]), p2=row(0,2,[8,1,4]);
+       pts.push(p1 ? H.yes("Player 1's scores in order","8.2.3","Player 1: 5 7 2.")
+         : H.no("Player 1's scores in order","8.2.3", runs[0].error?"The program stopped with an error. See above."
+             : row(0,1,[5,2,1])?"Player 1's line mixes up the two players: the round loop is outside the player loop. Make the player the outer loop, so player 1's three rounds are read first."
+             : "Output player 1's three scores on one line, e.g. <code>Player 1: 5 7 2</code>."));
+       pts.push(p2 ? H.yes("Player 2's scores in order","8.2.3","Player 2: 8 1 4.")
+         : H.no("Player 2's scores in order","8.2.3", "Output player 2's three scores on the next line, e.g. <code>Player 2: 8 1 4</code>."));
+       pts.push(p1&&p2&&row(1,1,[10,0,3])&&row(1,2,[6,6,9]) ? H.yes("Works for other scores","8.2.3","10 0 3 and 6 6 9 came out right too.")
+         : H.no("Works for other scores","8.2.3", !(p1&&p2)?"Get the first set of scores right first."
+             : "With different scores your output didn't follow. Output the values stored in the list, not fixed numbers."));
+       pts.push(H.commentPoint(info, H.attempted(pts.slice(0,5))));
+       return pts;
+     }}
+  ],
+
+  check:[
+    {type:"pseudo", source:"November 2025 Paper 22 Q2(b)(i)", marks:4, ref:"8.2.3, 8.1.6",
+     prompt:"A procedure <code>NewData</code> allows data for new contacts to be entered and stored in the 2D array <code>Contacts[]</code>. A parameter, <code>Number</code>, is used to pass values from the main algorithm to the procedure for the number of new contacts. Next, four pieces of contact data for each new contact are entered and stored at the start of the array.<br>(In this question <code>Contacts[]</code> has 500 rows and 4 columns, with indexes starting at 1.)<br>Complete the pseudocode for <code>PROCEDURE NewData</code>. Write out the whole completed procedure.",
+     code:`PROCEDURE NewData(..........)
+    FOR Row ← 1 TO ..........
+        FOR Column ← 1 TO 4
+            INPUT ..........
+
+
+ENDPROCEDURE`,
+     placeholder:"PROCEDURE NewData(...)\n    ...\nENDPROCEDURE",
+     model:`PROCEDURE NewData(Number : INTEGER)
+    FOR Row ← 1 TO Number
+        FOR Column ← 1 TO 4
+            INPUT Contacts[Row, Column]
+        NEXT Column
+    NEXT Row
+ENDPROCEDURE`,
+     mark(L,H,raw){
+       const pts=[], prog=H.pcParse(raw), s=prog.subs["newdata"];
+       const p=s&&s.kind==="PROCEDURE"&&s.params.length===1&&s.params[0].type==="INTEGER";
+       pts.push(p ? H.yes("Appropriate parameter in PROCEDURE line","8.1.6(b)",`<code>PROCEDURE NewData(${H.e(s.params[0].name)} : INTEGER)</code>.`)
+         : H.no("Appropriate parameter in PROCEDURE line","8.1.6(b)", !s?"Start with <code>PROCEDURE NewData(Number : INTEGER)</code>."
+             : s.params.length!==1?"It has one parameter, the number of new contacts: <code>Number : INTEGER</code>."
+             : "Give the parameter its name and data type, <code>Number : INTEGER</code>: examiners awarded this mark for both."));
+       const data=n=>[...Array(n*4).keys()].map(k=>"d"+k);
+       const go=n=>s?H.pcRun(raw,{main:false, call:{name:"NewData",args:[n]}, inputs:data(n).concat(["extra1","extra2","extra3","extra4"]), arrays:[["Contacts",[[1,500],[1,4]],"STRING"]], skipBad:true}):null;
+       const r2=go(2), r3=go(3);
+       const asked=r=>r?r.events.filter(e=>e[0]==="in").length:0;
+       // "must use Number as stated in question": the outer loop's end value is the identifier Number
+       const firstLoop=s&&s.body.find(x=>x.k==="for"||x.k==="while"||x.k==="repeat");
+       const refs=e=>!e?false:e.k==="var"?e.name.toLowerCase()==="number":["a","b"].some(k=>refs(e[k]));
+       const usesNumber=!!firstLoop&&(firstLoop.k==="for"?refs(firstLoop.to):refs(firstLoop.cond));
+       const counts=r2&&r3&&!r2.error&&!r3.error&&asked(r2)===8&&asked(r3)===12;
+       // the loop shape still earns its marks when only the INPUT line is wrong: FOR … TO Number around FOR Column ← 1 TO 4
+       const inner=firstLoop&&firstLoop.body&&firstLoop.body.find(x=>x.k==="for"&&x.to.k==="lit"&&x.to.v===4);
+       const badOnlyInside=prog.bad.length>0&&inner&&inner.body.some(x=>x.k==="bad");
+       const outer=usesNumber&&(counts||badOnlyInside);
+       pts.push(outer ? H.yes("Outer loop ends at Number","8.2.3","We called NewData(2) and NewData(3): it read 8 and then 12 values, four for each contact.")
+         : H.no("Outer loop ends at Number","8.2.3", !s?"Write the procedure first."
+             : !usesNumber&&counts?"It works, but the mark scheme says the outer loop must end at <code>Number</code>, as named in the question: <code>FOR Row ← 1 TO Number</code>."
+             : r2.error&&/more input/.test(r2.error)?"NewData(2) kept asking for more data than two contacts. The outer loop should stop at the parameter: <code>FOR Row ← 1 TO Number</code>."
+             : r2.error?`We ran NewData(2) and it stopped: ${H.e(r2.error)}`
+             : asked(r2)===8&&!usesNumber?"It works, but the mark scheme says the outer loop must end at <code>Number</code>, as named in the question: <code>FOR Row ← 1 TO Number</code>."
+             : `NewData(2) read ${asked(r2)} values instead of 8. The outer loop should run from 1 to the parameter: <code>FOR Row ← 1 TO Number</code>.`));
+       const cells=r=>[1,2].every(row=>[1,2,3,4].every(c=>r.cell("Contacts",row,c)==="d"+((row-1)*4+c-1)));
+       const idx=counts&&cells(r2);
+       pts.push(idx ? H.yes("Correct array reference in INPUT","8.2.2","Each value went into <code>Contacts[Row, Column]</code>: contact by contact, four columns each.")
+         : H.no("Correct array reference in INPUT","8.2.2", !counts&&!badOnlyInside?"Get the loops reading the right number of values first."
+             : badOnlyInside?`Line ${H.e(inner.body.find(x=>x.k==="bad").n)}: ${H.e(inner.body.find(x=>x.k==="bad").msg)}`
+             : "The values didn't land in the right elements. Input straight into the array with both loop variables: <code>INPUT Contacts[Row, Column]</code>, row first."));
+       const closed=s&&s.closed&&!prog.nextErrors.length&&!prog.bad.some(b=>/NEXT|FOR loop/.test(b.msg))&&(()=>{ let fors=0; const w=b=>b.forEach(x=>{ if (x.k==="for") fors++; ["body","then","else"].forEach(k=>x[k]&&w(x[k])); }); w(s.body); return fors>=2; })();
+       pts.push(closed ? H.yes("Both loops correctly terminated","8.2.3","NEXT Column closes the inner loop before NEXT Row closes the outer one.")
+         : H.no("Both loops correctly terminated","8.2.3", prog.nextErrors.length?`Line ${prog.nextErrors[0].n}: ${H.e(prog.nextErrors[0].msg)}`
+             : prog.bad.length?`Line ${prog.bad[0].n}: ${H.e(prog.bad[0].msg)}`
+             : !s?"Write the procedure first." : !s.closed?"Close the procedure with ENDPROCEDURE."
+             : "Use two FOR loops, one inside the other, each closed with its own NEXT."));
+       return pts;
+     }},
+    {type:"errors", source:"November 2025 Paper 22 Q2(a)", marks:5, ref:"8.2 / 7.8",
+     prompt:"This pseudocode algorithm is intended to input a first name from a user and search for it in a 2D array. If the name is found, the algorithm outputs all the remaining details for that name. The algorithm will continue to allow other names to be entered for searching, until the user input stops it.<br>Identify the line numbers of <b>five</b> errors in the pseudocode and suggest a correction for each error.",
+     code:`DECLARE Contacts : ARRAY[1:500, 1:4] OF REAL
+DECLARE Row : INTEGER
+DECLARE Column : INTEGER
+DECLARE Continue : BOOLEAN
+DECLARE Stop : BOOLEAN
+DECLARE FirstName : STRING
+Continue ← TRUE
+Stop ← FALSE
+WHILE Continue
+    Row ← 1
+    OUTPUT "Enter a first name "
+    OUTPUT FirstName
+    REPEAT
+        IF Contacts[Row, 1] = FirstName
+          THEN
+            FOR Column ← 1 TO 4
+                OUTPUT Contacts[Row, 1]
+            NEXT Column
+            Stop ← TRUE
+          ELSE
+            Row ← Row + 1
+        ENDIF
+    NEXT Stop OR Row > 500
+    OUTPUT "Search for another name? (Y or N)"
+    INPUT Answer
+    IF Answer = 'N' OR Answer = 'n'
+      THEN
+        Continue ← TRUE
+    ENDIF
+ENDWHILE`,
+     errors:[
+       {line:1, test:/^DECLARE\s+Contacts\s*:\s*ARRAY\s*\[\s*1\s*:\s*500\s*,\s*1\s*:\s*4\s*\]\s*OF\s+STRING$/i, fix:"DECLARE Contacts : ARRAY[1:500, 1:4] OF STRING", trap:[{re:/OF\s+TEXT/i,msg:"The pseudocode data type is STRING."}], why:"Names and contact details are text, so the array is STRING."},
+       {line:12, test:/^INPUT\s+FirstName$/i, fix:"INPUT FirstName", trap:[{re:/input\s*\(/i,msg:"That's Python. In pseudocode it is INPUT FirstName."}], why:"An output that should be an input: the user types the name to search for."},
+       {line:17, test:/^OUTPUT\s+Contacts\s*\[\s*Row\s*,\s*Column\s*\]$/i, fix:"OUTPUT Contacts[Row, Column]", trap:[{re:/\]\s*\[/,msg:"In pseudocode a 2D index uses one pair of brackets: Contacts[Row, Column]."}], why:"The column index must be the loop variable, so every detail is output, not column 1 four times."},
+       {line:23, test:/^UNTIL\s+Stop\s+OR\s+Row\s*>\s*500$/i, fix:"UNTIL Stop OR Row > 500", trap:[], why:"A REPEAT loop ends with UNTIL, not NEXT."},
+       {line:25, lines:[25,26], test:/^DECLARE\s+Answer\s*:\s*CHAR$/i, fix:"DECLARE Answer : CHAR (before line 25)", trap:[{re:/STRING/i,msg:"Answer holds a single character, compared with 'N', so the mark scheme declares it as CHAR."}], why:"Answer is used without being declared."},
+       {line:28, test:/^Continue\s*(←|<-)\s*FALSE$/i, fix:"Continue ← FALSE", trap:[], why:"Answering N should stop the outer loop, so Continue becomes FALSE."}
+     ]},
+    {type:"value", source:"exam-style", marks:2, ref:"8.2.3",
+     prompt:"Study this pseudocode. Write the two values that are output.",
+     code:`DECLARE Grid : ARRAY[1:3, 1:3] OF INTEGER
+FOR Row ← 1 TO 3
+    FOR Column ← 1 TO 3
+        Grid[Row, Column] ← Row + Column
+    NEXT Column
+NEXT Row
+OUTPUT Grid[3, 2]
+OUTPUT Grid[1, 1] + Grid[2, 3]`,
+     fields:[{label:"First value output",a:["5"]},{label:"Second value output",a:["7"]}],
+     model:"Each element holds row + column. Grid[3, 2] is 3 + 2 = 5. Grid[1, 1] is 2 and Grid[2, 3] is 5, so the second output is 7."}
+  ]
+};
+
+/* ------------------------------------------------------------
+   SKILL 22 — FILE HANDLING (8.3)
+   OPENFILE … FOR READ/WRITE, READFILE, WRITEFILE, CLOSEFILE.
+   Ahsan chose PSEUDOCODE-ONLY Apply tasks here (lang:"pc"): the
+   site runs the pupil's pseudocode against virtual files given by
+   each test and checks what is output and what ends up in the
+   files. Python equivalents are shown in Learn for interest.
+   File names belong in quotation marks (June 2026 schemes
+   "penalise once" when they are missing).
+   ------------------------------------------------------------ */
+// Shared checks for the file tasks and questions
+const FILE_H = {
+  ops:(r,op)=>(r.fileOps||[]).filter(o=>o.op===op),
+  opened:(r,name,mode)=>(r.fileOps||[]).some(o=>o.op==="open"&&o.lname===name.toLowerCase()&&o.mode===mode),
+  closed:(r,name)=>(r.fileOps||[]).some(o=>o.op==="close"&&o.lname===name.toLowerCase())&&!(r.stillOpen||[]).some(n=>n.toLowerCase()===name.toLowerCase()),
+  // file statements that use the name without quotation marks, or a different name from the one given.
+  // A variable that holds the name (FileName ← "Team.txt") is fine: its value is checked instead.
+  slips:(r,names)=>(r.fileOps||[]).filter(o=>(!o.quoted&&!o.viaVar)||!names.includes(o.name)),
+  // the statement kinds in a parsed program, anywhere (inside loops and IFs too)
+  find:(prog,f)=>{ const out=[]; const w=b=>(b||[]).forEach(s=>{ if (f(s)) out.push(s); ["body","then","else"].forEach(k=>s[k]&&w(s[k])); (s.arms||[]).forEach(a=>w(a.body)); s.other&&w(s.other); }); w(prog.main); Object.values(prog.subs).forEach(sb=>w(sb.body)); return out; },
+  file:(r,name)=>{ const k=Object.keys(r.files||{}).find(n=>n.toLowerCase()===name.toLowerCase()); return k?r.files[k]:undefined; }
+};
+
+SKILLS.s22 = {
+  n:22, title:"File handling", ref:"8.3",
+  intro:"Variables and arrays are lost when a program ends, but a file keeps its data. Learn to open a file for reading or writing, read and write data a line at a time, and close it again, in Cambridge pseudocode.",
+  learn:[
+    {h:"Why store data in a file?", html:`
+      <p>While a program runs, its variables and arrays are held in main memory (RAM). When the program ends, or the computer is switched off, they are <b>gone</b>.</p>
+      <p>Storing data in a <b>file</b> keeps a <b>permanent</b> copy on secondary storage, so the data:</p>
+      <ul><li>is not lost when the program closes or the computer is switched off</li>
+      <li>can be used again later, by this program or by another program</li>
+      <li>can be backed up, or transferred to another computer.</li></ul>
+      <p>Saving high scores, a contact list or a game's progress are all jobs for a file.</p>`,
+     after:`<div class="note">Examiners in June 2026 saw “so it can be compressed” given as a reason to store data in a file. That isn't a reason: give <b>permanent storage</b> or <b>use again later</b>.</div>`},
+
+    {h:"Open, use, close", html:`
+      <p>Every file job has three steps:</p>
+      <ol><li><b>Open</b> the file, saying how it will be used: <code>OPENFILE "Scores.txt" FOR READ</code> or <code>FOR WRITE</code>.</li>
+      <li><b>Use</b> it: <code>READFILE</code> or <code>WRITEFILE</code>.</li>
+      <li><b>Close</b> it when you've finished: <code>CLOSEFILE "Scores.txt"</code>.</li></ol>
+      <p>The file name is a string, so it goes in <b>quotation marks</b>. A file is open in one mode at a time.</p>
+      <p><b>Careful:</b> opening a file <code>FOR WRITE</code> creates a new file, and <b>any data already in it is lost</b>.</p>`,
+     py:`file = open("Scores.txt", "r")    # "r" = read
+# … read from it …
+file.close()
+
+file = open("Scores.txt", "w")    # "w" = write (old data lost)
+# … write to it …
+file.close()`,
+     pc:`OPENFILE "Scores.txt" FOR READ
+// … READFILE …
+CLOSEFILE "Scores.txt"
+
+OPENFILE "Scores.txt" FOR WRITE
+// … WRITEFILE …
+CLOSEFILE "Scores.txt"`},
+
+    {h:"Reading from a file", html:`
+      <p><code>READFILE "Names.txt", Name</code> reads the <b>next line</b> of the file and stores it in the variable <code>Name</code>. Each READFILE moves on to the following line.</p>
+      <p>This is the example from the Cambridge syllabus guide: it copies one line of text from one file to another.</p>`,
+     pc:`DECLARE LineOfText : STRING
+OPENFILE "FileA.txt" FOR READ
+OPENFILE "FileB.txt" FOR WRITE
+READFILE "FileA.txt", LineOfText
+WRITEFILE "FileB.txt", LineOfText
+CLOSEFILE "FileA.txt"
+CLOSEFILE "FileB.txt"`,
+     py:`file_a = open("FileA.txt", "r")
+file_b = open("FileB.txt", "w")
+line_of_text = file_a.readline()
+file_b.write(line_of_text)
+file_a.close()
+file_b.close()`},
+
+    {h:"Writing to a file", html:`
+      <p><code>WRITEFILE "HighScore.txt", Score</code> writes the value of <code>Score</code> into the file. Each WRITEFILE adds a <b>new line</b>, so writing a name and then a score gives a two-line file.</p>
+      <p>Write a single item of data, or a whole line of text held in a variable.</p>`,
+     pc:`INPUT PlayerName
+INPUT Score
+OPENFILE "HighScore.txt" FOR WRITE
+WRITEFILE "HighScore.txt", PlayerName
+WRITEFILE "HighScore.txt", Score
+CLOSEFILE "HighScore.txt"`,
+     py:`player_name = input("Name: ")
+score = int(input("Score: "))
+file = open("HighScore.txt", "w")
+file.write(player_name + "\\n")
+file.write(str(score) + "\\n")
+file.close()`},
+
+    {h:"Reading several lines", html:`
+      <p>To read several lines, put READFILE in a loop. You need to know how many lines to read: a common trick is to store the number of items on the <b>first line</b> of the file.</p>
+      <p>Here the first line of <code>Team.txt</code> says how many players follow, and the loop reads exactly that many.</p>`,
+     pc:`OPENFILE "Team.txt" FOR READ
+READFILE "Team.txt", HowMany
+FOR Index ← 1 TO HowMany
+    READFILE "Team.txt", Player
+    OUTPUT "Player ", Index, ": ", Player
+NEXT Index
+CLOSEFILE "Team.txt"`,
+     py:`file = open("Team.txt", "r")
+how_many = int(file.readline())
+for index in range(1, how_many + 1):
+    player = file.readline().strip()
+    print("Player", str(index) + ":", player)
+file.close()`},
+
+    {h:"What the examiners say", html:`
+      <div class="exam"><h3>Examiner reports</h3>
+        <blockquote>“Most candidates did not use the correct pseudocode for opening, reading from and closing a file. Some used actual program code.”<cite>June 2024 Paper 21 Q7(b)</cite></blockquote>
+        <blockquote>“Most candidates omitted the quote marks around the file name.”<cite>June 2026 Paper 21 Q5(c)</cite></blockquote>
+        <blockquote>“…omitted either part of the command word, such as CLOSE instead of CLOSEFILE or the variable name in the WRITEFILE line.”<cite>June 2026 Paper 21 Q5(c)</cite></blockquote>
+        <blockquote>“…did not use the pseudocode file handling commands as listed in the syllabus and used program code instead.”<cite>June 2026 Paper 22 Q7(b)</cite></blockquote>
+        <p>Use the four commands exactly: <code>OPENFILE "Name.txt" FOR READ</code>, <code>READFILE "Name.txt", Variable</code>, <code>WRITEFILE "Name.txt", Variable</code>, <code>CLOSEFILE "Name.txt"</code>. File name in quotation marks, every time.</p>
+      </div>`}
+  ],
+
+  practise:[
+    {type:"mcq", title:"Open for writing", ref:"8.3.2",
+     prompt:"Which statement opens <code>Scores.txt</code> so that data can be written to it?",
+     options:[
+       {t:"OPENFILE \"Scores.txt\" FOR WRITE", code:true, ok:true, why:"Correct: the command, the file name in quotation marks, and the mode."},
+       {t:"OPENFILE Scores.txt WRITE", code:true, why:"The name needs quotation marks, and the mode follows FOR."},
+       {t:"OPEN \"Scores.txt\" FOR WRITE", code:true, why:"The command word is OPENFILE. Examiners penalise shortened command words."},
+       {t:"OPENFILE \"Scores.txt\" FOR READ", code:true, why:"READ opens it for reading. Writing needs FOR WRITE."}
+     ]},
+    {type:"classify", title:"READ or WRITE?", ref:"8.3.2",
+     prompt:"Which mode should the file be opened in for each job?",
+     options:["READ","WRITE"],
+     items:[
+       {t:"Load last week's high scores into the game", a:"READ", why:"Loading means getting data out of the file."},
+       {t:"Save a new list of players", a:"WRITE", why:"Saving puts data into the file."},
+       {t:"Display every line of a quotation stored in a file", a:"READ", why:"The data is read from the file, then output."},
+       {t:"Create today's log file", a:"WRITE", why:"WRITE creates a new file."}
+     ]},
+    {type:"mcq", title:"Opening for WRITE", ref:"8.3.2",
+     prompt:"<code>Scores.txt</code> already holds 20 scores. A program opens it with <code>OPENFILE \"Scores.txt\" FOR WRITE</code> and writes one score. How many scores does the file hold afterwards?",
+     options:[
+       {t:"1", ok:true, why:"Correct. Opening FOR WRITE creates a new file: the 20 old scores are lost."},
+       {t:"21", why:"WRITE doesn't add to the end: a new file is created and the existing data is lost."},
+       {t:"20", why:"The write does happen, but only after the old data has been wiped."},
+       {t:"0", why:"The new score is written, so there is one."}
+     ]},
+    {type:"value", title:"Next line, please", ref:"8.3.2",
+     prompt:"<code>Team.txt</code> holds three lines: <code>Ali</code>, <code>Bea</code>, <code>Cy</code>. What is output?",
+     lang:"pc", code:`OPENFILE "Team.txt" FOR READ
+READFILE "Team.txt", First
+READFILE "Team.txt", Second
+CLOSEFILE "Team.txt"
+OUTPUT Second`,
+     fields:[{label:"Output",a:["Bea"],exact:true}],
+     why:"The first READFILE reads Ali into First; the second reads the <b>next</b> line, <b>Bea</b>, into Second."},
+    {type:"mcq", title:"A reason to use a file", ref:"8.3.1",
+     prompt:"Which of these is <b>not</b> a reason to store data in a file?",
+     options:[
+       {t:"So the data can be compressed", ok:true, why:"Correct: that isn't a reason. Examiners saw this answer in June 2026 and gave no mark."},
+       {t:"So the data is not lost when the program ends", why:"That is a reason: a file is permanent storage."},
+       {t:"So the data can be used again later by another program", why:"That is a reason: a file can be read by other programs."},
+       {t:"So the data can be transferred to another computer", why:"That is a reason given in the mark scheme."}
+     ]},
+    {type:"mcq", title:"Write the variable", ref:"8.3.2",
+     prompt:"<code>Username.txt</code> is open for writing. Which statement stores the value of <code>NewUsername</code> in it?",
+     options:[
+       {t:"WRITEFILE \"Username.txt\", NewUsername", code:true, ok:true, why:"Correct: file name first, then the variable."},
+       {t:"WRITEFILE \"Username.txt\"", code:true, why:"Examiners saw this: the variable name is missing from the WRITEFILE line."},
+       {t:"WRITE \"Username.txt\", NewUsername", code:true, why:"The command word is WRITEFILE."},
+       {t:"WRITEFILE NewUsername, \"Username.txt\"", code:true, why:"The file name comes first, then the variable."}
+     ]}
+  ],
+
+  apply:[
+    {id:"a1", lang:"pc", marks:5, title:"Save the high score", context:"Gaming",
+     brief:`<p>Write <b>pseudocode</b> that:</p>
+      <ul><li>inputs a player's name and their score</li>
+      <li>stores them in the file <code>HighScore.txt</code>: the name on the first line, the score on the second</li>
+      <li>closes the file.</li></ul>
+      <p>The checker runs your pseudocode and then looks inside <code>HighScore.txt</code>.</p>`,
+     example:[["in","Zara"],["in","150"],["out","(HighScore.txt now holds: Zara, 150)"]],
+     tests:[
+       {label:"Zara, 150", kind:"normal", inputs:["Zara","150"], expect:"HighScore.txt holds:\nZara\n150"},
+       {label:"Omar, 99", kind:"normal", inputs:["Omar","99"], expect:"HighScore.txt holds:\nOmar\n99"}
+     ],
+     hints:[
+       "Two INPUT lines first: <code>INPUT PlayerName</code> and <code>INPUT Score</code>.",
+       "Open the file for writing: <code>OPENFILE \"HighScore.txt\" FOR WRITE</code>.",
+       "Then <code>WRITEFILE \"HighScore.txt\", PlayerName</code>, the same for Score, and <code>CLOSEFILE \"HighScore.txt\"</code>."
+     ],
+     model:{pc:`INPUT PlayerName
+INPUT Score
+OPENFILE "HighScore.txt" FOR WRITE
+WRITEFILE "HighScore.txt", PlayerName
+WRITEFILE "HighScore.txt", Score
+CLOSEFILE "HighScore.txt"`,
+       py:`player_name = input("Name: ")
+score = input("Score: ")
+file = open("HighScore.txt", "w")
+file.write(player_name + "\\n")
+file.write(score + "\\n")
+file.close()`},
+     mark(R){
+       const {H,runs}=R, pts=[], F=FILE_H;
+       const ins=r=>r.events.filter(e=>e[0]==="in").length;
+       const inOk=runs.every(r=>ins(r)===2);
+       pts.push(inOk ? H.yes("Inputs the name and the score","8.1.3","Two INPUT statements read the name and the score.")
+         : H.no("Inputs the name and the score","8.1.3", runs[0].error&&!ins(runs[0])?`Your pseudocode stopped: ${H.e(runs[0].error.msg)}`:"Input the name and the score: <code>INPUT PlayerName</code>, <code>INPUT Score</code>."));
+       const open=runs.every(r=>F.opened(r,"HighScore.txt","WRITE"));
+       pts.push(open ? H.yes("Opens HighScore.txt for writing","8.3.2","<code>OPENFILE … FOR WRITE</code>.")
+         : H.no("Opens HighScore.txt for writing","8.3.2", F.ops(runs[0],"open").some(o=>o.mode==="READ")?"To store data the file must be opened FOR WRITE."
+             : F.ops(runs[0],"open").length?`Open the file called <code>HighScore.txt</code> (you opened ${H.e(F.ops(runs[0],"open")[0].name)}).`
+             : "Open the file first: <code>OPENFILE \"HighScore.txt\" FOR WRITE</code>."));
+       const want=[["Zara","150"],["Omar","99"]];
+       const stored=runs.every((r,i)=>{ const f=F.file(r,"HighScore.txt"); return f&&f.length===2&&f[0]===want[i][0]&&f[1]===want[i][1]; });
+       const f0=F.file(runs[0],"HighScore.txt");
+       pts.push(stored ? H.yes("Writes the name, then the score","8.3.2","HighScore.txt ends up holding the name on line 1 and the score on line 2.")
+         : H.no("Writes the name, then the score","8.3.2", runs[0].error?`Your pseudocode stopped: ${H.e(runs[0].error.msg)}`
+             : !f0?"Nothing was written to HighScore.txt. Use <code>WRITEFILE \"HighScore.txt\", PlayerName</code>."
+             : F.ops(runs[0],"open").filter(o=>o.mode==="WRITE").length>1?"You opened HighScore.txt FOR WRITE more than once. Each time wipes what was there, so only the last write survived. Open it once, write both lines, then close it."
+             : `HighScore.txt held <code>${H.e(f0.join(" | ")||"nothing")}</code>. Write the name first, then the score, with one WRITEFILE each.`));
+       const close=runs.every(r=>F.closed(r,"HighScore.txt"));
+       pts.push(close ? H.yes("Closes the file","8.3.2","<code>CLOSEFILE</code> when finished.")
+         : H.no("Closes the file","8.3.2", /^\s*CLOSE\b(?!FILE)/im.test(R.raw)?"The command word is CLOSEFILE: CLOSE on its own isn't a pseudocode command.":"Close the file at the end: <code>CLOSEFILE \"HighScore.txt\"</code>."));
+       const anyOps=(runs[0].fileOps||[]).length>0, sl=F.slips(runs[0],["HighScore.txt"]);
+       pts.push(anyOps&&!sl.length ? H.yes("File name in quotation marks throughout","8.3.2","<code>\"HighScore.txt\"</code> every time.")
+         : H.no("File name in quotation marks throughout","8.3.2", !anyOps?"Use the file commands first."
+             : sl.some(o=>!o.quoted&&!o.viaVar)?`The file name needs quotation marks every time (line ${H.e(String(sl.find(o=>!o.quoted&&!o.viaVar).n))}). Examiners in June 2026 said most candidates left them out.`
+             : `Use the name exactly as given, <code>"HighScore.txt"</code>, in every file statement.`));
+       return pts;
+     }},
+
+    {id:"a2", lang:"pc", marks:6, title:"Read the team sheet", context:"Football",
+     brief:`<p>The file <code>Team.txt</code> holds a team sheet. Its <b>first line</b> is the number of players, and each line after that is one player's name.</p>
+      <p>Write <b>pseudocode</b> that reads the file and outputs every player with their number, e.g. <code>Player 1: Mo</code>, then closes the file. It must work for a team sheet of any length.</p>`,
+     files:{"Team.txt":["3","Mo","Li","Kai"]},
+     example:[["out","Player 1: Mo\nPlayer 2: Li\nPlayer 3: Kai"]],
+     tests:[
+       {label:"Three players", kind:"normal", inputs:[], files:{"Team.txt":["3","Mo","Li","Kai"]}, expect:"Player 1: Mo\nPlayer 2: Li\nPlayer 3: Kai"},
+       {label:"Two players", kind:"normal", inputs:[], files:{"Team.txt":["2","Ava","Zed"]}, expect:"Player 1: Ava\nPlayer 2: Zed"},
+       {label:"Five players", kind:"extreme", inputs:[], files:{"Team.txt":["5","Ian","Joy","Ken","Lua","Max"]}, expect:"Player 1: Ian … Player 5: Max"}
+     ],
+     hints:[
+       "Open it for reading, then read the first line into a variable: <code>READFILE \"Team.txt\", HowMany</code>.",
+       "A loop that runs that many times: <code>FOR Index ← 1 TO HowMany</code>, with a READFILE and an OUTPUT inside.",
+       "After <code>NEXT Index</code>, close the file."
+     ],
+     model:{pc:`OPENFILE "Team.txt" FOR READ
+READFILE "Team.txt", HowMany
+FOR Index ← 1 TO HowMany
+    READFILE "Team.txt", Player
+    OUTPUT "Player ", Index, ": ", Player
+NEXT Index
+CLOSEFILE "Team.txt"`,
+       py:`file = open("Team.txt", "r")
+how_many = int(file.readline())
+for index in range(1, how_many + 1):
+    player = file.readline().strip()
+    print("Player", str(index) + ":", player)
+file.close()`},
+     mark(R){
+       const {H,runs,prog}=R, pts=[], F=FILE_H;
+       const open=runs.every(r=>F.opened(r,"Team.txt","READ"));
+       pts.push(open ? H.yes("Opens Team.txt for reading","8.3.2","<code>OPENFILE … FOR READ</code>.")
+         : H.no("Opens Team.txt for reading","8.3.2", F.ops(runs[0],"open").some(o=>o.mode==="WRITE")?"Opening FOR WRITE would wipe the team sheet. Open it FOR READ."
+             : runs[0].error&&!F.ops(runs[0],"open").length?`Your pseudocode stopped: ${H.e(runs[0].error.msg)}`
+             : "Open the file first: <code>OPENFILE \"Team.txt\" FOR READ</code>."));
+       const team=[["Mo","Li","Kai"],["Ava","Zed"],["Ian","Joy","Ken","Lua","Max"]];
+       const listed=i=>{ const r=runs[i]; if (r.error) return false; const L=r.out.filter(l=>team[i].some(n=>new RegExp("\\b"+n+"\\b").test(l)));
+         return L.length===team[i].length&&L.every((l,k)=>new RegExp("\\b"+team[i][k]+"\\b").test(l)&&new RegExp("(^|\\D)"+(k+1)+"(\\D|$)").test(l)); };
+       const first=listed(0);
+       pts.push(first ? H.yes("Outputs every player, numbered","8.3.2","Player 1: Mo, Player 2: Li, Player 3: Kai.")
+         : H.no("Outputs every player, numbered","8.3.2", runs[0].error?`Your pseudocode stopped: ${H.e(runs[0].error.msg)}`
+             : runs[0].out.some(l=>/\b3\b/.test(l)&&!/Mo|Li|Kai/.test(l))?"The first line is the number of players, not a name. Read it into its own variable before the loop."
+             : "Output each player on its own line with their number, e.g. <code>OUTPUT \"Player \", Index, \": \", Player</code>."));
+       const any=first&&listed(1)&&listed(2);
+       const past=runs.find(r=>r.error&&/no more data/.test(r.error.msg));
+       pts.push(any ? H.yes("Works for any number of players","8.3.2","Two and five players worked too: the loop uses the number read from the file.")
+         : H.no("Works for any number of players","8.3.2", !first?"Get the three-player sheet right first."
+             : past?"Your loop tried to read past the end of the file. Use the number on the first line to decide how many names to read."
+             : "With a different team sheet the output didn't follow. Loop as many times as the number on the first line says, not a fixed 3."));
+       const loops=F.find(prog,s=>["for","while","repeat"].includes(s.k));
+       const readInLoop=loops.some(l=>F.find({main:l.body, subs:{}},s=>s.k==="readf").length>0);
+       pts.push(readInLoop ? H.yes("READFILE inside a loop","8.3.2","Each time round the loop reads the next line.")
+         : H.no("READFILE inside a loop","8.3.2", "Put the READFILE for each name inside a loop, so one statement reads every name."));
+       const fine=runs.filter(r=>!r.error), close=fine.length>0&&fine.every(r=>F.closed(r,"Team.txt"));
+       pts.push(close ? H.yes("Closes the file","8.3.2","<code>CLOSEFILE</code> after the loop.")
+         : H.no("Closes the file","8.3.2", runs.some(r=>r.error)?"Fix the error above so the program reaches CLOSEFILE.":"Close the file after the loop: <code>CLOSEFILE \"Team.txt\"</code>."));
+       const anyOps=(runs[0].fileOps||[]).length>0, sl=F.slips(runs[0],["Team.txt"]);
+       pts.push(anyOps&&!sl.length&&open ? H.yes("File name in quotation marks throughout","8.3.2","<code>\"Team.txt\"</code> every time.")
+         : H.no("File name in quotation marks throughout","8.3.2", !anyOps?"Use the file commands first."
+             : sl.some(o=>!o.quoted&&!o.viaVar)?`The file name needs quotation marks every time (line ${H.e(String(sl.find(o=>!o.quoted&&!o.viaVar).n))}).`
+             : `Use the name exactly as given, <code>"Team.txt"</code>, in every file statement.`));
+       return pts;
+     }}
+  ],
+
+  check:[
+    {type:"pseudo", source:"June 2026 Paper 21 Q5(c)", marks:3, ref:"8.3.2",
+     prompt:"The new username is stored in the variable <code>NewUsername</code>.<br>Write the pseudocode to store <code>NewUsername</code> to the file <code>Username.txt</code>",
+     placeholder:"OPENFILE ...",
+     model:`OPENFILE "Username.txt" FOR WRITE
+WRITEFILE "Username.txt", NewUsername
+CLOSEFILE "Username.txt"`,
+     mark(L,H,raw){
+       // A wrong line loses its own mark only (skipBad). An extra DECLARE/INPUT of NewUsername is harmless, so the
+       // username is also given as input, and the WRITEFILE is checked by what it writes OR by the statement itself.
+       const pts=[], F=FILE_H, r=H.pcRun(raw,{globals:[["NewUsername","zara99"]], inputs:["zara99","zara99","zara99"], skipBad:true}), prog=H.pcParse(raw);
+       const writesVar=F.find(prog,s=>s.k==="writef"&&s.e.k==="var"&&s.e.name.toLowerCase()==="newusername"&&(s.f.lit||"").toLowerCase()==="username.txt").length>0;
+       const py=/\bopen\s*\(|\.write\s*\(|\bwith\s+open/i.test(raw);
+       pts.push(F.opened(r,"Username.txt","WRITE") ? H.yes("Correct opening of file","8.3.2","<code>OPENFILE … FOR WRITE</code>.")
+         : H.no("Correct opening of file","8.3.2", py?"That's program code. Examiners want the pseudocode commands: <code>OPENFILE \"Username.txt\" FOR WRITE</code>."
+             : F.ops(r,"open").some(o=>o.mode==="READ")?"Storing data needs FOR WRITE." : r.error&&!F.ops(r,"open").length?`Line problem: ${H.e(r.error)}` : "Open the file for writing: <code>OPENFILE \"Username.txt\" FOR WRITE</code>."));
+       const f=F.file(r,"Username.txt");
+       pts.push((f&&f.includes("zara99"))||writesVar ? H.yes("Correct writing to file","8.3.2","<code>WRITEFILE … , NewUsername</code> stores the username.")
+         : H.no("Correct writing to file","8.3.2", r.error?`We ran it and it stopped: ${H.e(r.error)}` : /WRITEFILE\s+\S+\s*$/im.test(raw)?"Examiners saw this: the variable name is missing from the WRITEFILE line. Write <code>WRITEFILE \"Username.txt\", NewUsername</code>." : "Write the variable to the file: <code>WRITEFILE \"Username.txt\", NewUsername</code>."));
+       pts.push(F.closed(r,"Username.txt") ? H.yes("Correct closing of file","8.3.2","<code>CLOSEFILE</code>.")
+         : H.no("Correct closing of file","8.3.2", /^\s*CLOSE\b(?!FILE)/im.test(raw)?"The command word is CLOSEFILE, not CLOSE. Examiners saw this in June 2026." : "Close the file: <code>CLOSEFILE \"Username.txt\"</code>."));
+       // "If missing quotation marks from file or Username.txt not used, penalise once and FT"
+       const sl=F.slips(r,["Username.txt"]);
+       if (sl.length&&pts.some(x=>x.ok)){ const k=pts.map(x=>x.ok).lastIndexOf(true); pts[k]=H.no(pts[k].t,"8.3.2",(sl.some(o=>!o.quoted&&!o.viaVar)?"Penalised once: the file name must be in quotation marks, <code>\"Username.txt\"</code>. Most candidates lost this in June 2026.":"Penalised once: use the file name given, <code>\"Username.txt\"</code>.")+" Everything else was credited."); }
+       return pts;
+     }},
+    {type:"pseudo", source:"June 2024 Paper 21 Q7(b)", marks:4, ref:"8.3.2",
+     maxNote:"There are five mark points; any four earn full marks.",
+     prompt:"The function <code>LENGTH(X)</code> calculates the length of a string <code>X</code><br>Write the pseudocode statements to:<ul><li>read the contents of the text file <code>Quotation.txt</code> into an appropriate string variable that has been declared</li><li>output the string in upper case and the length of the string.</li></ul>",
+     placeholder:"DECLARE ...\nOPENFILE ...",
+     model:`DECLARE Words : STRING
+OPENFILE "Quotation.txt" FOR READ
+READFILE "Quotation.txt", Words
+OUTPUT UCASE(Words), LENGTH(Words)
+CLOSEFILE "Quotation.txt"`,
+     mark(L,H,raw){
+       const pts=[], F=FILE_H, text="Practice makes perfect", prog=H.pcParse(raw);
+       const r=H.pcRun(raw,{files:{"Quotation.txt":[text]}, skipBad:true});
+       const decl=F.find(prog,s=>s.k==="declare"&&s.type==="STRING").flatMap(s=>s.names.map(n=>n.toLowerCase()));
+       const reads=F.find(prog,s=>s.k==="readf");
+       pts.push(decl.length ? H.yes("Declaration of a string variable","8.1.2",`<code>DECLARE … : STRING</code>.`)
+         : H.no("Declaration of a string variable","8.1.2", F.find(prog,s=>s.k==="declare").length?"The variable holds text, so declare it as STRING.":"Declare the variable first, e.g. <code>DECLARE Words : STRING</code>."));
+       const bare=(r.fileOps||[]).some(o=>!o.quoted), tip=bare?" (The 2024 mark scheme accepted the name without quotation marks, but since 2026 examiners penalise it: always write <code>\"Quotation.txt\"</code>.)":"";
+       pts.push(F.opened(r,"Quotation.txt","READ") ? H.yes("Correct use of OPENFILE for reading","8.3.2","<code>OPENFILE … FOR READ</code>."+tip)
+         : H.no("Correct use of OPENFILE for reading","8.3.2", /\bopen\s*\(/i.test(raw)?"That's program code. Examiners noted “Some used actual program code”. Use <code>OPENFILE \"Quotation.txt\" FOR READ</code>." : "Open the file for reading: <code>OPENFILE \"Quotation.txt\" FOR READ</code>."));
+       const rv=reads.length&&!reads[0].t.idx?reads[0].t.name.toLowerCase():null;
+       pts.push(rv&&decl.includes(rv)&&!r.error ? H.yes("Correct use of READFILE with the string variable","8.3.2","The file's text is read into your declared string variable.")
+         : H.no("Correct use of READFILE with the string variable","8.3.2", !reads.length?"Read the text into your variable: <code>READFILE \"Quotation.txt\", Words</code>."
+             : rv&&!decl.includes(rv)?`Read into the variable you declared as STRING (you read into ${H.e(reads[0].t.name)}).`
+             : r.error?`We ran it and it stopped: ${H.e(r.error)}` : "Read into a single string variable."));
+       const out=r.out.join(" ");
+       pts.push(!r.error&&out.includes(text.toUpperCase())&&new RegExp("(^|\\D)"+text.length+"(\\D|$)").test(out) ? H.yes("Correct use of UCASE and LENGTH and output of each","8.1.4(e)",`For “${text}” it output the text in capitals and its length, ${text.length}.`)
+         : H.no("Correct use of UCASE and LENGTH and output of each","8.1.4(e)", r.error?`We ran it and it stopped: ${H.e(r.error)}` : "Output both: <code>OUTPUT UCASE(Words), LENGTH(Words)</code>."));
+       pts.push(F.closed(r,"Quotation.txt") ? H.yes("Correct use of CLOSEFILE","8.3.2","<code>CLOSEFILE</code>.")
+         : H.no("Correct use of CLOSEFILE","8.3.2", "Close the file: <code>CLOSEFILE \"Quotation.txt\"</code>."));
+       // "One mark per mark point, max four": five mark points, and the score is capped at 4 (ckPseudo caps at q.marks).
+       return pts;
+     }},
+    {type:"pseudo", source:"November 2024 Paper 22 Q10", marks:6, ref:"8.3.2",
+     maxNote:"There are nine mark points; any six earn full marks.",
+     prompt:"The function <code>LENGTH(X)</code> calculates the length of a string <code>X</code><br>Write the pseudocode statements to:<ul><li>allow a line of text to be input to an appropriate variable</li><li>store this line of text in a text file called <code>Main.txt</code></li><li>calculate the length of the line of text and output the text in lower case along with its length</li><li>store the lower-case line of text in a text file called <code>Lowercase.txt</code></li></ul>Make sure that any variables used are declared and that both text files are closed after they have been used.",
+     placeholder:"DECLARE ...\nINPUT ...",
+     model:`DECLARE LineOfText : STRING
+DECLARE LowercaseText : STRING
+INPUT LineOfText
+OPENFILE "Main.txt" FOR WRITE
+WRITEFILE "Main.txt", LineOfText
+CLOSEFILE "Main.txt"
+LowercaseText ← LCASE(LineOfText)
+OUTPUT LowercaseText, LENGTH(LineOfText)
+OPENFILE "Lowercase.txt" FOR WRITE
+WRITEFILE "Lowercase.txt", LowercaseText
+CLOSEFILE "Lowercase.txt"`,
+     mark(L,H,raw){
+       const F=FILE_H, line="Hello World Cup", prog=H.pcParse(raw), r=H.pcRun(raw,{inputs:[line], skipBad:true});
+       const mp=[];
+       const decl=F.find(prog,s=>s.k==="declare"&&s.type==="STRING").length>0;
+       mp.push(decl ? H.yes("Declaration of string variable(s)","8.1.2","Declared as STRING.") : H.no("Declaration of string variable(s)","8.1.2","Declare the variable for the text: <code>DECLARE LineOfText : STRING</code>."));
+       const inp=r.events.some(e=>e[0]==="in");
+       mp.push(inp ? H.yes("Input of a line of text","8.1.3","INPUT reads the line.") : H.no("Input of a line of text","8.1.3", r.error?`We ran it and it stopped: ${H.e(r.error)}`:"Input the line: <code>INPUT LineOfText</code>."));
+       const code=L.map(l=>l.s).join("\n");
+       mp.push(/\bLCASE\s*\(/i.test(code) ? H.yes("Correct use of LCASE","8.1.4(e)","LCASE gives the lower-case text.") : H.no("Correct use of LCASE","8.1.4(e)","Use <code>LCASE(LineOfText)</code> for the lower-case version."));
+       mp.push(/\bLENGTH\s*\(/i.test(code) ? H.yes("Correct use of LENGTH","8.1.4(e)","LENGTH gives the number of characters.") : H.no("Correct use of LENGTH","8.1.4(e)","Use <code>LENGTH(LineOfText)</code>."));
+       const opened=F.opened(r,"Main.txt","WRITE")||F.opened(r,"Lowercase.txt","WRITE");
+       const bare=(r.fileOps||[]).some(o=>!o.quoted);
+       mp.push(opened ? H.yes("Opening of a required text file by its given name","8.3.2","OPENFILE … FOR WRITE with the given name."+(bare?" (The 2024 mark scheme accepted names without quotation marks, but since 2026 examiners penalise it: always use them.)":"")) : H.no("Opening of a required text file by its given name","8.3.2","Open each file for writing: <code>OPENFILE \"Main.txt\" FOR WRITE</code>."));
+       const m=F.file(r,"Main.txt"), lo=F.file(r,"Lowercase.txt");
+       mp.push(m&&m.length===1&&m[0]===line ? H.yes("Storing the line of text in Main.txt","8.3.2","Main.txt holds the line as typed.") : H.no("Storing the line of text in Main.txt","8.3.2", m?`Main.txt held <code>${H.e(m.join(" | ")||"nothing")}</code>: it should hold the line exactly as typed.`:"Write the original line to Main.txt."));
+       mp.push(lo&&lo.length===1&&lo[0]===line.toLowerCase() ? H.yes("Storing the lower-case line in Lowercase.txt","8.3.2","Lowercase.txt holds the lower-case line.") : H.no("Storing the lower-case line in Lowercase.txt","8.3.2", lo?`Lowercase.txt held <code>${H.e(lo.join(" | ")||"nothing")}</code>.`:"Write the lower-case line to Lowercase.txt."));
+       mp.push(F.closed(r,"Main.txt")&&F.closed(r,"Lowercase.txt") ? H.yes("Closing of both text files","8.3.2","Both files are closed.") : H.no("Closing of both text files","8.3.2","Close both files with CLOSEFILE."));
+       const out=r.out.join(" ");
+       mp.push(!r.error&&out.includes(line.toLowerCase())&&new RegExp("(^|\\D)"+line.length+"(\\D|$)").test(out) ? H.yes("Correct output","8.1.3",`The lower-case text and its length, ${line.length}.`) : H.no("Correct output","8.1.3", r.error?`We ran it and it stopped: ${H.e(r.error)}`:"Output the lower-case text and its length: <code>OUTPUT LCASE(LineOfText), LENGTH(LineOfText)</code>."));
+       // "One mark per mark point (max six)": nine mark points, and the score is capped at 6.
+       return mp;
+     }}
+  ]
+};
+
 /* ============================================================
    GAME LAYER — XP, levels, streaks, badges, locks, celebrations.
    XP is worked out from saved progress (never stored), so it
@@ -7160,7 +8408,7 @@ const LEVELS = [
   [0,"Beginner"],[60,"Explorer"],[150,"Builder"],[280,"Coder"],
   [450,"Debugger"],[650,"Developer"],[900,"Pro"],[1200,"Ace"],
   [1600,"Expert"],[2100,"Architect"],[2700,"Master"],[3400,"Champion"],
-  [4300,"Grandmaster"],[5000,"Hero"],[5800,"Legend"],[6800,"Mythic"]
+  [4300,"Grandmaster"],[5000,"Hero"],[5800,"Legend"],[6800,"Mythic"],[8000,"Titan"]
 ];
 const GROUP_COLOUR = {A:"violet",B:"blue",C:"teal",D:"orange",E:"pink",F:"green",G:"amber",H:"red"};
 const STAGE_ICON = {learn:"📖",practise:"✏️",apply:"💻",check:"🎓"};
@@ -7752,7 +9000,7 @@ function fastPaper(w, seed){
   }).filter(Boolean);
   // The coding task comes from the last two skills of the world just before, which build on everything earlier.
   const prev = SKILL_MAP[SKILL_MAP.findIndex(gr=>gr.g===w)-1];
-  const tasks = worldSkills(prev).slice(-2).flatMap(id=>SKILLS[id].apply.filter(a=>!a.fix&&!a.starter).map(a=>({id,a})));
+  const tasks = worldSkills(prev).slice(-2).flatMap(id=>SKILLS[id].apply.filter(a=>!a.fix&&!a.starter&&a.lang!=="pc").map(a=>({id,a})));
   const task = tasks.length ? pick(tasks) : null;
   return {qs, task, total: qs.reduce((n,x)=>n+x.q.marks,0) + (task?task.a.marks:0)};
 }
@@ -7983,15 +9231,20 @@ function finishFast(w, paper){
    CALL, DECLARE, CONSTANT, ←, INPUT, OUTPUT, IF/THEN/ELSE/ENDIF,
    CASE OF/OTHERWISE/ENDCASE, FOR/TO/STEP/NEXT, WHILE/DO/ENDWHILE,
    REPEAT/UNTIL, MOD, DIV, ROUND, RANDOM, LENGTH, UCASE, LCASE,
-   SUBSTRING. No arrays or files yet.
+   SUBSTRING, 1D/2D ARRAYs (World E) and OPENFILE / READFILE /
+   WRITEFILE / CLOSEFILE on virtual files given by the test.
    ============================================================ */
 const PC = (()=>{
   const KW = new Set(("PROCEDURE ENDPROCEDURE FUNCTION ENDFUNCTION RETURNS RETURN CALL DECLARE CONSTANT INPUT OUTPUT "+
-    "IF THEN ELSE ENDIF CASE OF OTHERWISE ENDCASE FOR TO STEP NEXT WHILE DO ENDWHILE REPEAT UNTIL AND OR NOT TRUE FALSE MOD DIV").split(" "));
+    "IF THEN ELSE ENDIF CASE OF OTHERWISE ENDCASE FOR TO STEP NEXT WHILE DO ENDWHILE REPEAT UNTIL AND OR NOT TRUE FALSE MOD DIV "+
+    "ARRAY OPENFILE READFILE WRITEFILE CLOSEFILE").split(" "));
+  const FILEKW = new Set(["OPENFILE","READFILE","WRITEFILE","CLOSEFILE"]);
   const TYPES = new Set(["INTEGER","REAL","CHAR","STRING","BOOLEAN"]);
   const LIB = new Set(["MOD","DIV","ROUND","RANDOM","LENGTH","UCASE","LCASE","SUBSTRING"]);
   class PcError extends Error {}
   const fail = msg => { throw new PcError(msg); };
+  const MAX_STR = 10000, MAX_OPS = 5000, MAX_NAME = 100;
+  const short = v => { const t=String(v); return t.length>40 ? t.slice(0,40)+"…" : t; };   // values quoted in messages
 
   /* ---------- lines and tokens ---------- */
   function normLine(l){
@@ -8072,7 +9325,12 @@ const PC = (()=>{
       if (t.t==="kw" && (t.v==="MOD"||t.v==="DIV") && isOp("(")) return {k:"call",name:t.v,args:args()};
       if (t.t==="id"){
         if (isOp("(")) return {k:"call",name:t.v,args:args()};
-        if (isOp("[")) fail("Arrays aren't supported in this checker yet.");
+        if (isOp("[")){
+          i++; const idx=[or()]; while (isOp(",")){ i++; idx.push(or()); }
+          expect("]");
+          if (isOp("[")) fail(`Write a 2D array index with one pair of brackets: ${t.v}[Row, Column].`);
+          return {k:"idx",name:t.v,idx};
+        }
         return {k:"var",name:t.v};
       }
       fail(`${t.raw||t.v} can't be used here.`);
@@ -8114,6 +9372,25 @@ const PC = (()=>{
     });
   }
 
+  // A variable or an array element that can be assigned to: Total, Names[Count], Grid[Row, Column]
+  function target(toks, what){
+    if (!toks.length || toks[0].t!=="id") fail(`${what} needs a variable name.`);
+    if (toks.length===1) return {name:toks[0].v, idx:null};
+    const P=exprParser(toks), e=P.or();
+    if (!P.done()) fail(`Unexpected ${P.peek().raw||P.peek().v} after ${what.toLowerCase()}.`);
+    if (e.k!=="idx") fail(`${what} needs a variable name.`);
+    return {name:e.name, idx:e.idx};
+  }
+  // The file identifier at the start of a file statement: "Names.txt", 'Names.txt', Names.txt or a variable
+  function fileRef(text){
+    let m=text.match(/^\s*"([^"]*)"\s*(.*)$/)||text.match(/^\s*'([^']*)'\s*(.*)$/);
+    if (m) return {lit:m[1], quoted:true, rest:m[2]};
+    m=text.match(/^\s*([A-Za-z0-9_][A-Za-z0-9_.\-]*)\s*(.*)$/);
+    if (!m) fail("Give the file name, e.g. \"Names.txt\".");
+    if (m[1].includes(".")) return {lit:m[1], quoted:false, rest:m[2]};
+    return {v:m[1], quoted:false, rest:m[2]};
+  }
+
   /* ---------- statements ---------- */
   function parse(text){
     const src=String(text||"").split("\n");
@@ -8121,10 +9398,12 @@ const PC = (()=>{
     src.forEach((raw,n)=>{
       let l=stripComment(normLine(raw)).trim().replace(/^\d{1,3}[.)]?\s+(?=[A-Za-z])/,"");   // "01 Total ← 0"
       if (!l) return;
+      const first=(l.match(/^[A-Za-z]+/)||[""])[0].toUpperCase();
+      if (FILEKW.has(first)){ lines.push({n:n+1, text:l, toks:[{t:"kw",v:first}]}); return; }   // file names may be bare (Names.txt)
       try { lines.push({n:n+1, text:l, toks:tokens(l)}); }
       catch(e){ lines.push({n:n+1, text:l, bad:e.message}); }
     });
-    const subs=Object.create(null), main=[], bad=[], warnings=[];
+    const subs=Object.create(null), main=[], bad=[], warnings=[], nextErrors=[];
     let k=0;
     const head=L=>L.toks&&L.toks[0]&&L.toks[0].t==="kw"?L.toks[0].v:null;
     // Parse a block until one of the end words; returns {body, end}
@@ -8151,17 +9430,51 @@ const PC = (()=>{
       try { return stmt(L, inSub); }
       catch(e){ if (!(e instanceof PcError)) throw e; bad.push({n:L.n, msg:e.message}); return {k:"bad", n:L.n, msg:e.message}; }
     }
+    let inline=0;
     function stmt(L, inSub){
+      if (++inline>40){ inline--; fail("Too many statements inside statements."); }
+      try { return stmtIn(L, inSub); } finally { inline--; }
+    }
+    function stmtIn(L, inSub){
       const T=L.toks, h=head(L), n=L.n;
       const kwAt=(v,from=0)=>T.findIndex((t,j)=>j>=from&&t.t==="kw"&&t.v===v);
       if (h==="PROCEDURE"||h==="FUNCTION"){
         if (inSub) fail("Define procedures and functions at the start of the code, not inside another one.");
         return defineSub(L);
       }
+      if (FILEKW.has(h)){
+        const rest=L.text.replace(/^[A-Za-z]+\s*/,"");
+        if (/^\(/.test(rest)) fail(`That looks like program code. In pseudocode write ${h} "Names.txt"${h==="OPENFILE"?" FOR READ":h==="CLOSEFILE"?"":", Variable"}.`);
+        const f=fileRef(rest);
+        if (h==="OPENFILE"){
+          const m=f.rest.match(/^FOR\s+([A-Za-z]+)\s*$/i);
+          if (!m) fail('Write OPENFILE "Names.txt" FOR READ (or FOR WRITE).');
+          const mode=m[1].toUpperCase(); if (mode!=="READ"&&mode!=="WRITE") fail("The file modes are READ and WRITE.");
+          return {k:"open", f, mode, n};
+        }
+        if (h==="CLOSEFILE"){ if (f.rest.trim()) fail('Write CLOSEFILE "Names.txt".'); return {k:"close", f, n}; }
+        const m=f.rest.match(/^,\s*(.+)$/);
+        if (!m) fail(`Write ${h} "Names.txt", ${h==="READFILE"?"Variable":"Value"} with a comma after the file name.`);
+        const toks=tokens(m[1]);
+        if (h==="READFILE") return {k:"readf", f, t:target(toks,"READFILE"), n};
+        return {k:"writef", f, e:parseExpr(toks,"The value to write"), n};
+      }
       if (h==="DECLARE"){
         const c=T.findIndex(t=>t.t==="op"&&t.v===":");
         if (c<0) fail("DECLARE needs a colon and a data type, e.g. DECLARE Total : INTEGER.");
-        if (T.slice(c+1).some(t=>t.t==="kw"&&t.v==="ARRAY")||T.some(t=>t.v==="ARRAY")) fail("Arrays aren't supported in this checker yet.");
+        if (T[c+1]&&T[c+1].t==="kw"&&T[c+1].v==="ARRAY"){
+          // DECLARE Names : ARRAY[1:30] OF STRING   /   DECLARE Grid : ARRAY[1:3, 1:3] OF CHAR
+          const names=splitCommas(T.slice(1,c)).map(p=>{ if (p.length!==1||p[0].t!=="id") fail("DECLARE needs a name."); return p[0].v; });
+          const open=c+2, close=T.findIndex((t,j)=>j>open&&t.t==="op"&&t.v==="]");
+          if (!(T[open]&&T[open].v==="[")||close<0) fail("Write the bounds in square brackets: ARRAY[1:10] OF INTEGER.");
+          const dims=splitCommas(T.slice(open+1,close)).map(d=>{
+            const col=d.findIndex(t=>t.t==="op"&&t.v===":");
+            if (col<0) fail("Each bound needs a colon: ARRAY[1:10]."); return {lo:parseExpr(d.slice(0,col),"The lower bound"), hi:parseExpr(d.slice(col+1),"The upper bound")}; });
+          if (dims.length>2) fail("Arrays have one or two dimensions.");
+          if (!(T[close+1]&&T[close+1].t==="kw"&&T[close+1].v==="OF")) fail("Write ARRAY[…] OF and a data type.");
+          const ty=T[close+2]&&T[close+2].t==="kw"&&TYPES.has(T[close+2].v)?T[close+2].v:null; if (!ty) fail("The array needs a data type such as INTEGER.");
+          return {k:"declareArr", names, dims, type:ty, n};
+        }
         const names=splitCommas(T.slice(1,c)).map(p=>{ if (p.length!==1||p[0].t!=="id") fail("DECLARE needs a name."); return p[0].v; });
         const ty=T[c+1]&&T[c+1].t==="kw"&&TYPES.has(T[c+1].v)?T[c+1].v:null; if (!ty) fail("DECLARE needs a data type such as INTEGER.");
         return {k:"declare", names, type:ty, n};
@@ -8171,8 +9484,9 @@ const PC = (()=>{
         return {k:"assign", name:T[1].v, e:parseExpr(T.slice(3),"The constant's value"), constant:true, n};
       }
       if (h==="INPUT"){
-        if (T.length!==2||T[1].t!=="id") fail("INPUT needs one variable name.");
-        return {k:"input", name:T[1].v, n};
+        if (T.length<2) fail("INPUT needs one variable name.");
+        const tg=target(T.slice(1),"INPUT");
+        return {k:"input", name:tg.name, idx:tg.idx, n};
       }
       if (h==="OUTPUT"){
         return {k:"output", es:splitCommas(T.slice(1)).map(p=>parseExpr(p,"An OUTPUT value")), n};
@@ -8228,6 +9542,9 @@ const PC = (()=>{
         if (!T[1]||T[1].t!=="id"||a!==2||to<0) fail("Write a FOR loop as FOR Count ← 1 TO 10.");
         const loop={k:"for", name:T[1].v, from:parseExpr(T.slice(3,to)), to:parseExpr(T.slice(to+1, st<0?T.length:st)), step:st<0?null:parseExpr(T.slice(st+1)), n};
         const b=block(["NEXT"],inSub); if (b.end!=="NEXT") fail("This FOR loop has no NEXT.");
+        // NEXT names the wrong counter: it still closes this loop (so the rest can run), but marking can see it
+        const nx=b.line.toks[1];
+        if (nx&&nx.t==="id"&&nx.v.toLowerCase()!==T[1].v.toLowerCase()) nextErrors.push({n:b.line.n, msg:`NEXT ${nx.v} doesn't match FOR ${T[1].v}: close the inner loop first, with its own counter.`});
         k++; loop.body=b.body; return loop;
       }
       if (h==="WHILE"){
@@ -8245,6 +9562,12 @@ const PC = (()=>{
       // assignment
       if (T[0].t==="id" && T[1] && T[1].t==="op" && (T[1].v==="←")){
         return {k:"assign", name:T[0].v, e:parseExpr(T.slice(2),"The value to assign"), n};
+      }
+      if (T[0].t==="id" && T[1] && T[1].t==="op" && T[1].v==="["){
+        const a=T.findIndex(t=>t.t==="op"&&t.v==="←");
+        if (a<0) fail(T.some(t=>t.t==="op"&&t.v==="=")?"In pseudocode, assign with ← (not =).":"This line can't be read as pseudocode.");
+        const tg=target(T.slice(0,a),"The assignment");
+        return {k:"assign", name:tg.name, idx:tg.idx, e:parseExpr(T.slice(a+1),"The value to assign"), n};
       }
       if (T[0].t==="id" && T[1] && T[1].t==="op" && T[1].v==="=") fail("In pseudocode, assign with ← (not =).");
       // a bare call such as "Countdown(5)": run it, but marking can see it wasn't a CALL
@@ -8290,7 +9613,7 @@ const PC = (()=>{
       const st=statement(L, false);
       if (st && st.k!=="def") main.push(st);
     }
-    return {subs, main, bad, warnings, lines:lines.length};
+    return {subs, main, bad, warnings, nextErrors, lines:lines.length};
   }
 
   /* ---------- running ---------- */
@@ -8304,7 +9627,10 @@ const PC = (()=>{
     let prog;
     try { prog = typeof text==="string" ? parse(text) : text; }
     catch(e){ return {out:[], ret:undefined, error:"This answer is too deeply nested to read.", called:[], prog:null, globals:{}}; }
-    const inputs=[...(opts.inputs||[])], out=[], called=[];
+    const inputs=[...(opts.inputs||[])], out=[], called=[], events=[], fileOps=[];
+    // Virtual files: name → list of lines. READ needs the file to exist; WRITE starts it empty.
+    const files=Object.create(null), open=Object.create(null);
+    Object.entries(opts.files||{}).forEach(([k,v])=>{ files[k]=(v||[]).map(String); });
     const limit=opts.maxSteps||200000;
     let steps=0, rnd=0;
     const randoms=opts.rand||[0.5];
@@ -8312,15 +9638,53 @@ const PC = (()=>{
     const tick=()=>{ if (++steps>limit) fail("It ran for too long. Is a loop repeating forever?"); };
     class Ret { constructor(v){ this.v=v; } }
     const look=(env,name)=>{ const key=name.toLowerCase(); if (env.L&&env.L.has(key)) return env.L; if (G.has(key)) return G; return null; };
-    function get(env,name){
+    function get(env,name,arrOk){
       const s=look(env,name); if (!s) fail(`${name} is used before it has a value.`);
-      const v=s.get(name.toLowerCase()); if (v===undefined) fail(`${name} is used before it has a value.`); return v;
+      const v=s.get(name.toLowerCase()); if (v===undefined) fail(`${name} is used before it has a value.`);
+      if (!arrOk && v&&typeof v==="object"&&v.arr) fail(`${name} is an array: use one element with an index, e.g. ${name}[1].`);
+      return v;
     }
     function set(env,name,v){
       const key=name.toLowerCase();
       if (env.L && (env.L.has(key) || !G.has(key))) env.L.set(key,v); else G.set(key,v);
     }
-    function num(v,what){ if (!isNum(v)) fail(`${what} needs a number, but it was given ${typeof v==="string"?`"${v}"`:show(v)}.`); return v; }
+    const isArr=v=>v&&typeof v==="object"&&v.arr===true;
+    function key(env, name, idxExprs){
+      const A=get(env,name, true);
+      if (!isArr(A)) fail(`${name} isn't an array, so it can't have an index in square brackets.`);
+      if (idxExprs.length!==A.dims.length) fail(A.dims.length===2?`${name} is a 2D array: give a row and a column, e.g. ${name}[Row, Column].`:`${name} is a 1D array: give one index, e.g. ${name}[Index].`);
+      const ix=idxExprs.map((x,d)=>{
+        const v=ev(x,env);
+        if (!Number.isInteger(v)) fail(`An array index must be a whole number, but ${name} was given ${typeof v==="string"?`"${short(v)}"`:short(show(v))}.`);
+        const {lo,hi}=A.dims[d];
+        if (v<lo||v>hi) fail(`Index ${v} is outside the array ${name}[${A.dims.map(q=>q.lo+":"+q.hi).join(", ")}].`);
+        return v;
+      });
+      return {A, k:ix.join(","), ix};
+    }
+    function readIdx(env, name, idxExprs){
+      const {A,k,ix}=key(env,name,idxExprs), v=A.data.get(k);
+      if (v===undefined) fail(`${name}[${ix.join(", ")}] is used before it has a value.`);
+      return v;
+    }
+    function store(env, name, idxExprs, v){
+      if (!idxExprs){ const cur=look(env,name); if (cur&&isArr(cur.get(name.toLowerCase()))) fail(`${name} is an array: store a value in one element, e.g. ${name}[1].`); set(env,name,v); return; }
+      const {A,k}=key(env,name,idxExprs); A.data.set(k,v);
+    }
+    function makeArr(name, dims, type){
+      let size=1; dims.forEach(d=>{ if (!Number.isInteger(d.lo)||!Number.isInteger(d.hi)) fail(`The bounds of ${name} must be whole numbers.`); if (d.hi<d.lo) fail(`The upper bound of ${name} is below its lower bound.`); size*=d.hi-d.lo+1; });
+      if (size>100000) fail(`${name} is too big for this checker.`);
+      return {arr:true, name, dims, type, data:new Map()};
+    }
+    const fname=(f,env)=>{ const v=f.lit!==undefined?f.lit:get(env,f.v); if (typeof v!=="string") fail(`${f.v} should hold the file name.`);
+      if (v.length>MAX_NAME) fail("That file name is too long.");
+      // the same file whatever the capitals (Team.txt / team.txt), like most school computers
+      return Object.keys(files).find(k=>k.toLowerCase()===v.toLowerCase()) || Object.keys(open).find(k=>k.toLowerCase()===v.toLowerCase()) || v; };
+    const typed=(f,env)=>f.lit!==undefined?f.lit:get(env,f.v);   // the name exactly as the pupil wrote it
+    const logOp=o=>{ if (fileOps.length>=MAX_OPS) fail("It used files far too many times. Is a loop repeating forever?"); o.lname=o.name.toLowerCase(); fileOps.push(o); };
+    // every string kept or built is capped, so one step can't do unbounded work
+    const cap=v=>{ if (typeof v==="string"&&v.length>MAX_STR) fail("A string grew far too long. Is a loop adding to it forever?"); return v; };
+    function num(v,what){ if (!isNum(v)) fail(`${what} needs a number, but it was given ${typeof v==="string"?`"${short(v)}"`:short(show(v))}.`); return v; }
     function callSub(name, argv, env, how){
       const s=prog.subs[name.toLowerCase()];
       if (!s) fail(`There's no procedure or function called ${name}.`);
@@ -8338,6 +9702,7 @@ const PC = (()=>{
       switch(e.k){
         case "lit": return e.v;
         case "var": return get(env,e.name);
+        case "idx": return readIdx(env,e.name,e.idx);
         case "neg": return -num(ev(e.a,env),"A minus sign");
         case "not": { const v=ev(e.a,env); if (typeof v!=="boolean") fail("NOT needs TRUE or FALSE."); return !v; }
         case "bin": {
@@ -8348,7 +9713,7 @@ const PC = (()=>{
           }
           const a=ev(e.a,env), b=ev(e.b,env);
           switch(e.op){
-            case "+": if (typeof a==="string"||typeof b==="string") return show(a)+show(b); return num(a,"+")+num(b,"+");
+            case "+": if (typeof a==="string"||typeof b==="string"){ const x=show(a), y=show(b); if (x.length+y.length>MAX_STR) fail("A string grew far too long. Is a loop adding to it forever?"); return x+y; } return num(a,"+")+num(b,"+");
             case "-": return num(a,"-")-num(b,"-");
             case "*": return num(a,"*")*num(b,"*");
             case "/": if (num(b,"/")===0) fail("It divided by zero."); return num(a,"/")/b;
@@ -8374,7 +9739,7 @@ const PC = (()=>{
               case "LENGTH": need(1); return String(v[0]).length;
               case "UCASE": need(1); return String(v[0]).toUpperCase();
               case "LCASE": need(1); return String(v[0]).toLowerCase();
-              case "SUBSTRING": need(3); return String(v[0]).substr(num(v[1],"SUBSTRING")-1, num(v[2],"SUBSTRING"));
+              case "SUBSTRING": need(3); return String(v[0]).substr(num(v[1],"SUBSTRING")-1, Math.max(0,Math.min(MAX_STR,num(v[2],"SUBSTRING"))));
             }
           }
           const s=prog.subs[e.name.toLowerCase()];
@@ -8392,14 +9757,48 @@ const PC = (()=>{
         tick();
         switch(s.k){
           case "bad": if (opts.skipBad) break; fail(`Line ${s.n}: ${s.msg}`);
-          case "declare": s.names.forEach(nm=>(env.L||G).set(nm.toLowerCase(), ({INTEGER:0,REAL:0,BOOLEAN:false})[s.type] ?? "")); break;
-          case "assign": set(env,s.name, ev(s.e,env)); break;
+          case "declare": s.names.forEach(nm=>{ tick(); (env.L||G).set(nm.toLowerCase(), ({INTEGER:0,REAL:0,BOOLEAN:false})[s.type] ?? ""); }); break;
+          case "declareArr": {
+            const dims=s.dims.map(d=>({lo:num(ev(d.lo,env),"The lower bound"), hi:num(ev(d.hi,env),"The upper bound")}));
+            s.names.forEach(nm=>{ tick(); (env.L||G).set(nm.toLowerCase(), makeArr(nm, dims, s.type)); }); break;
+          }
+          case "assign": { const v=cap(ev(s.e,env)); if (isArr(v)) fail("A whole array can't be copied in one statement."); store(env,s.name,s.idx,v); break; }
           case "input": {
             if (!inputs.length) fail("It asked for more input than the test gives it.");
-            const raw=String(inputs.shift()); const n=Number(raw);
-            set(env,s.name, raw.trim()!==""&&!isNaN(n)?n:raw); break;
+            const raw=cap(String(inputs.shift())); const n=Number(raw);
+            events.push(["in",raw]);
+            store(env,s.name,s.idx, raw.trim()!==""&&!isNaN(n)?n:raw); break;
           }
-          case "output": out.push(s.es.map(x=>show(ev(x,env))).join("")); if (out.length>2000) fail("It output far too much. Is a loop repeating forever?"); break;
+          case "output": { const line=s.es.map(x=>show(ev(x,env))).join(""); out.push(line); events.push(["out",line+"\n"]); if (out.length>2000) fail("It output far too much. Is a loop repeating forever?"); break; }
+          case "open": {
+            const nm=fname(s.f,env); logOp({op:"open", name:typed(s.f,env), mode:s.mode, quoted:s.f.quoted, viaVar:s.f.v!==undefined, n:s.n});
+            if (open[nm]) fail(`"${nm}" is already open. Close it before opening it again.`);
+            if (s.mode==="READ" && !(nm in files)) fail(`There's no file called "${nm}" to read.`);
+            if (s.mode==="WRITE") files[nm]=[];
+            if (Object.keys(files).length>20) fail("Too many files.");
+            open[nm]={mode:s.mode, pos:0}; break;
+          }
+          case "readf": {
+            const nm=fname(s.f,env), o=open[nm]; logOp({op:"read", name:typed(s.f,env), quoted:s.f.quoted, viaVar:s.f.v!==undefined, n:s.n});
+            if (!o) fail(`Open "${nm}" FOR READ before reading from it.`);
+            if (o.mode!=="READ") fail(`"${nm}" is open FOR WRITE, so it can't be read.`);
+            if (o.pos>=files[nm].length) fail(`There's no more data to read in "${nm}".`);
+            const raw=cap(files[nm][o.pos++]), n=Number(raw);
+            store(env,s.t.name,s.t.idx, raw.trim()!==""&&!isNaN(n)?n:raw); break;
+          }
+          case "writef": {
+            const nm=fname(s.f,env), o=open[nm]; logOp({op:"write", name:typed(s.f,env), quoted:s.f.quoted, viaVar:s.f.v!==undefined, n:s.n});
+            if (!o) fail(`Open "${nm}" FOR WRITE before writing to it.`);
+            if (o.mode!=="WRITE") fail(`"${nm}" is open FOR READ, so it can't be written to.`);
+            const v=ev(s.e,env); if (isArr(v)) fail("Write one value at a time to a file.");
+            if (files[nm].length>=2000) fail("It wrote far too much to the file. Is a loop repeating forever?");
+            files[nm].push(cap(show(v))); break;
+          }
+          case "close": {
+            const nm=fname(s.f,env); logOp({op:"close", name:typed(s.f,env), quoted:s.f.quoted, viaVar:s.f.v!==undefined, n:s.n});
+            if (!open[nm]) fail(`"${nm}" isn't open, so it can't be closed.`);
+            delete open[nm]; break;
+          }
           case "return": throw new Ret(s.e?ev(s.e,env):undefined);
           case "call": {
             const sub=prog.subs[s.name.toLowerCase()];
@@ -8413,6 +9812,7 @@ const PC = (()=>{
           }
           case "for": {
             const a=num(ev(s.from,env),"FOR"), b=num(ev(s.to,env),"FOR"), st=s.step?num(ev(s.step,env),"STEP"):1;
+            { const cur=look(env,s.name); if (cur&&isArr(cur.get(s.name.toLowerCase()))) fail(`${s.name} is an array, so it can't be the loop counter.`); }
             if (st===0) fail("A FOR loop can't STEP by 0.");
             for (let v=a; st>0?v<=b:v>=b; v+=st){ tick(); set(env,s.name,v); exec(s.body,env); }
             break;
@@ -8422,10 +9822,12 @@ const PC = (()=>{
         }
       }
     }
-    const res={out, ret:undefined, error:null, called, prog};
+    const res={out, ret:undefined, error:null, called, prog, events, fileOps, files};
     try {
       if (!opts.skipBad && prog.bad.length && opts.main!==false) fail(`Line ${prog.bad[0].n}: ${prog.bad[0].msg}`);
       (opts.globals||[]).forEach(([k,v])=>G.set(k.toLowerCase(),v));
+      // Arrays the question says already exist: [name, [[lo,hi],…], type, {"1,2": value, …}]
+      (opts.arrays||[]).forEach(([nm,dims,type,vals])=>{ const A=makeArr(nm, dims.map(([lo,hi])=>({lo,hi})), type); Object.entries(vals||{}).forEach(([k,v])=>A.data.set(k,v)); G.set(nm.toLowerCase(),A); });
       if (opts.main!==false) exec(prog.main, {L:null, depth:0});
       if (opts.call) res.ret=callSub(opts.call.name, opts.call.args||[], {L:null, depth:0}, "test");
     } catch(e){
@@ -8434,6 +9836,9 @@ const PC = (()=>{
       else res.error="This answer couldn't be run.";
     }
     res.globals=Object.fromEntries(G);
+    res.stillOpen=Object.keys(open);
+    // Read an element of a (global) array after the run: res.cell("Names", 3) or res.cell("Grid", 2, 3)
+    res.cell=(nm,...ix)=>{ const A=G.get(String(nm).toLowerCase()); return A&&A.arr?A.data.get(ix.join(",")):undefined; };
     return res;
   }
   return {parse, run, show};
@@ -8470,6 +9875,9 @@ function cleanPractiseDraft(q, d){
     return v.some(x=>x!==null)?v:undefined;
   }
 }
+// An error-correction question asks for every listed error, or "any N of M" when the paper lists more
+// possible errors than it has marks (q.marks < q.errors.length).
+const errFields = q => Math.min(q.errors.length, q.marks);
 function cleanCheckDraft(q, d){
   if (q.type==="value" && Array.isArray(d)){ const v=clipList(d,q.fields.length,FIELD_MAX); return anyText(v)?v:undefined; }
   if (q.type==="pseudo" && typeof d==="string" && d) return d.slice(0,TEXT_MAX);
@@ -8483,7 +9891,7 @@ function cleanCheckDraft(q, d){
     return {text:clip(o.text,TEXT_MAX), revealed:o.revealed===true, ticks};
   }
   if (q.type==="errors" && (Array.isArray(o.ln) || Array.isArray(o.fx))){
-    const v={ln:clipList(o.ln,q.errors.length,20), fx:clipList(o.fx,q.errors.length,FIELD_MAX)};
+    const nf=errFields(q), v={ln:clipList(o.ln,nf,20), fx:clipList(o.fx,nf,FIELD_MAX)};
     return anyText(v.ln)||anyText(v.fx) ? v : undefined;
   }
   if (q.type==="trace" && Array.isArray(d)){
@@ -9173,9 +10581,26 @@ const H = {
     if (e.type==="NameError") return `<code>${esc(callText(rec))}</code> stopped with an error: ${esc(e.msg)}. Inside the ${kind}, use its parameters (and its own variables), not variables from the main program.`;
     return `<code>${esc(callText(rec))}</code> stopped with an error: ${esc(e.type)}: ${esc(e.msg)}${e.line?` (line ${e.line})`:""}.`;
   },
+  // Output lines with the print calls (and source lines) that wrote them (World E).
+  outLines(run){
+    const out=[]; let cur={t:"",calls:new Set(),src:new Set()};
+    for (const e of run.events){ if (e[0]!=="out") continue;
+      String(e[1]).split("\n").forEach((p,k)=>{ if (k>0){ out.push(cur); cur={t:"",calls:new Set(),src:new Set()}; }
+        if (p){ cur.t+=p; if (e[2]!=null) cur.calls.add(e[2]); if (e[3]!=null) cur.src.add(e[3]); } }); }
+    if (cur.t) out.push(cur);
+    return out.map(x=>({t:x.t.trim(), calls:x.calls, src:x.src}));
+  },
+  // Were these n lines printed by a loop? Several print calls made them, from fewer lines of code than lines printed.
+  loopPrinted(run, test, n){
+    const L=H.outLines(run).filter(x=>test(x.t)); if (L.length<n) return false;
+    const calls=new Set(), src=new Set(); L.forEach(x=>{ x.calls.forEach(c=>calls.add(c)); x.src.forEach(c=>src.add(c)); });
+    return calls.size>=n && src.size<n;
+  },
+  // What a run printed after its last input (a menu or welcome printed before the input doesn't count).
+  afterInput(run){ let k=-1; run.events.forEach((e,j)=>{ if (e[0]==="in") k=j; }); return run.events.slice(k+1).filter(e=>e[0]==="out").map(e=>e[1]).join(""); },
   // Run Cambridge pseudocode (checkpoint answers). See pseudo.js.
   pcRun(text, opts){ return PC.run(text, opts); },
-  pcParse(text){ return PC.parse(text); }
+  pcParse(text){ try { return PC.parse(text); } catch(e){ return {bad:[{n:1,msg:"This answer is too deeply nested to read."}], main:[], subs:Object.create(null), warnings:[]}; } }
 };
 
 /* ---------- friendly error messages ---------- */
@@ -9227,18 +10652,20 @@ function renderApply(id, el){
     <div class="taskhead"><span class="kicker">Task ${i+1} of ${s.apply.length}</span><span class="ctx">${a.context}</span><span class="best"></span></div><h2>${a.title}</h2>
     <div class="split tsplit"><div class="tbrief">
     <div class="brief">${a.brief}</div>
-    ${a.starter?codeFig(a.starter,"py",{copy:true,numbered:true,caption:a.starterCaption||"🐞 Code to fix: copy it into your editor"}):""}
+    ${a.starter?codeFig(a.starter,a.lang==="pc"?"pc":"py",{copy:true,numbered:true,caption:a.starterCaption||"🐞 Code to fix: copy it into your editor"}):""}
+    ${a.files?`<div class="lbl">File${Object.keys(a.files).length>1?"s":""} it uses</div>${filesHTML(a.files)}`:""}
     <div class="lbl">Example run</div>${termHTML(a.example)}
-    <div class="how"><div><b>1 · Write</b>in your own editor</div><div><b>2 · Run</b>and test it yourself</div><div><b>3 · Paste</b>it into the code box</div><div><b>4 · Check</b>and read the feedback</div></div>
+    ${a.lang==="pc"?`<div class="how"><div><b>1 · Plan</b>on paper or in your notes</div><div><b>2 · Trace</b>it with the example data</div><div><b>3 · Type</b>it into the box</div><div><b>4 · Check</b>and read the feedback</div></div>`
+      :`<div class="how"><div><b>1 · Write</b>in your own editor</div><div><b>2 · Run</b>and test it yourself</div><div><b>3 · Paste</b>it into the code box</div><div><b>4 · Check</b>and read the feedback</div></div>`}
     ${a.hints.map((h,j)=>`<details class="hint"><summary>💡 Hint ${j+1}</summary><p>${h}</p></details>`).join("")}
     </div><div class="twork">
-    <div class="lbl" style="margin-top:0">Your Python code</div>
-    <textarea class="codein" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="Paste or type your program here"></textarea><p class="tabhint muted">Tab indents. Press Esc, then Tab, to move to the next button.</p>
+    <div class="lbl" style="margin-top:0">${a.lang==="pc"?"Your pseudocode":"Your Python code"}</div>
+    <textarea class="codein" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="${a.lang==="pc"?"Type your Cambridge pseudocode here (use ← or <-)":"Paste or type your program here"}"></textarea><p class="tabhint muted">Tab indents. Press Esc, then Tab, to move to the next button.</p>
     <div class="row actions"><button class="btn go big chk">▶ Check my code</button><button class="btn mdl"></button><span class="status"></span></div>
     <div class="model"></div>
     <div class="result"></div></div></div></section>`).join("");
   s.apply.forEach(a=>wireApply(id, a));
-  PY.start().catch(()=>{});
+  if (s.apply.some(a=>a.lang!=="pc")) PY.start().catch(()=>{});
 }
 function wireApply(id, a){
   const root = $(`#ap-${a.id}`), ta = $("textarea",root), st = $(".status",root), p = P(id);
@@ -9265,9 +10692,9 @@ function wireApply(id, a){
     if (!src.trim()){ st.textContent="Paste your code first."; return; }
     if (src.length>CODE_MAX){ st.textContent="This code is too long. Use fewer than 20,000 characters."; return; }
     const btn=$(".chk",root), hadFocus=document.activeElement===btn; btn.disabled=true;
-    st.textContent = PY.worker ? "Running your code…" : "Loading Python (the first time takes a few seconds)…";
+    st.textContent = a.lang==="pc" ? "Running your pseudocode…" : PY.worker ? "Running your code…" : "Loading Python (the first time takes a few seconds)…";
     let out;
-    try { out = await PY.check(src, a.tests.map(testSpec)); }
+    try { out = a.lang==="pc" ? pcCheck(a, src) : await PY.check(src, a.tests.map(testSpec)); }
     catch(e){ st.textContent=""; btn.disabled=false; $(".result",root).innerHTML=`<div class="errbox"><b>Couldn't load the Python checker.</b><div>Check your internet connection and try again. Learn and Practise still work offline.</div></div>`; return; }
     btn.disabled=false;
     // Disabling a focused button drops focus to the page; give it back, so a pop-up returns focus here.
@@ -9308,14 +10735,37 @@ function testKindBlurb(a){
   if(a.tests.some(t=>t.call)) out.push("A call test runs only your definitions, then calls your procedure or function itself with the values shown, so it checks the subroutine on its own.");
   return out.join(" ");
 }
+// Pseudocode Apply tasks (World E files): run each test with the pseudocode interpreter and virtual files.
+function pcCheck(a, src){
+  let prog;
+  try { prog=PC.parse(src); } catch(e){ prog={bad:[{n:1,msg:"This pseudocode is too deeply nested to read."}], main:[], subs:{}}; }
+  if (prog.bad.length) return {pc:true, prog, runs:[]};
+  const runs=a.tests.map(t=>{
+    const files=JSON.parse(JSON.stringify(t.files||{}));
+    const r=PC.run(prog,{inputs:t.inputs||[], files});
+    return {events:r.events, error:r.error?{type:"PcError", msg:r.error, line:null}:null, unusedInputs:(t.inputs||[]).length-r.events.filter(e=>e[0]==="in").length, files:r.files, fileOps:r.fileOps, stillOpen:r.stillOpen, out:r.out, res:r};
+  });
+  return {pc:true, prog, runs};
+}
+// Files shown on a test card, trimmed like the screen output (a runaway program can write a lot).
+function filesHTML(files, label){
+  const all=Object.entries(files), shown=all.slice(0,5);
+  return shown.map(([nm,lines])=>`<div class="filebox"><div class="filehead">📄 ${esc(String(nm).slice(0,100))}${label?` <span class="muted">${label}</span>`:""}</div><pre class="term">${esc(lines.length?clipScreen(lines.slice(0,41).join("\n").slice(0,2600)):"(empty)")}</pre></div>`).join("")
+    + (all.length>5?`<p class="muted">…and ${all.length-5} more file${all.length-5===1?"":"s"}.</p>`:"");
+}
 function feedbackHTML(a, src, out, p){
+  if (out.pc && out.prog.bad.length){
+    const b=out.prog.bad.slice(0,4);
+    return {cls:"notyet", html:`<div class="scorehead notyet"><span class="big">Not run yet</span><span>Some lines can't be read as Cambridge pseudocode. Fix ${b.length>1?"these":"this"} first, then check again.</span></div>
+      <div class="errbox">${b.map(x=>`<div><b>Line ${x.n}:</b> ${esc(x.msg)}</div>`).join("")}${out.prog.bad.length>4?`<div>…and ${out.prog.bad.length-4} more.</div>`:""}</div>`};
+  }
   if (out.unsupported) return {cls:"notyet",html:`<div class="errbox"><b>This code cannot run in the checker.</b><div>${esc(out.unsupported)}</div></div>`};
   if (out.timeout) return {html:`<div class="errbox"><b>Your program took too long.</b><div>It may be stuck in a loop that never ends. Check your code and try again.</div></div>`};
   if (out.internal) return {html:`<div class="errbox"><b>Something went wrong in the checker.</b><div>${esc(out.internal)}</div></div>`};
   if (out.syntax){
     return {cls:"notyet", html:`<div class="scorehead notyet"><span class="big">Not run yet</span><span>Python found a problem before it could run your code. Fix this first, then check again.</span></div>${explainError(out.syntax, src)}`};
   }
-  const R = {info:out.info, runs:out.runs, H, task:a};
+  const R = out.pc ? {raw:src, L:pcLines(src), prog:out.prog, runs:out.runs, H, task:a} : {info:out.info, runs:out.runs, H, task:a};
   const pts = a.mark(R);
   const got = pts.filter(x=>x.ok).length, of = pts.length;
   if (of!==a.marks) throw new Error("Task mark count does not match its definition");
@@ -9327,13 +10777,16 @@ function feedbackHTML(a, src, out, p){
     const t=a.tests[i];
     const res = t.scored===false ? `<span class="info">For information</span>` : r.error ? `<span class="fail">Error</span>` : "";
     const calls = r.calls ? `<div class="callrows">${r.calls.map((c,k)=>`<div>▶ calls <code>${esc(callText(c))}</code>${c.error?` <span class="er">${esc(c.error.type==="Missing"?"not found":c.error.type==="TooManyInputs"?"asked for input":c.error.type)}</span>`:t.showRet!==false&&c.type!=="NoneType"?` ↩ returns <code>${esc(c.repr)}</code>`:""}${c.watch?Object.entries(c.watch).map(([w,v])=>` · <code>${esc(w)}</code> is now <code>${esc(v===null?"(not set)":v)}</code>`).join(""):""}</div>`).join("")}</div>` : "";
+    const given = t.files ? `<div class="lbl">File${Object.keys(t.files).length>1?"s":""} at the start</div>${filesHTML(t.files)}` : "";
+    const written = r.files ? Object.entries(r.files).filter(([nm,v])=>!t.files||JSON.stringify(t.files[nm])!==JSON.stringify(v)) : [];
+    const wrote = written.length ? `<div class="lbl">Files afterwards</div>${filesHTML(Object.fromEntries(written))}` : "";
     return `<div class="testcard"><div class="th"><span class="tag ${t.kind}">${t.kind==="change"?"change test":t.kind==="call"?"call test":t.kind}</span><b>${esc(t.label)}</b>${(t.inputs||[]).length?`<span class="muted">inputs: ${t.inputs.map(x=>`<code>${esc(x)}</code>`).join(" ")}</span>`:""} ${res}</div>${calls}
       <div class="two" style="margin-top:6px"><div><div class="lbl">${r.calls?"What it printed":"Your program's screen"}</div><pre class="term">${esc(clipScreen(H.screen(r))||"(no output)")}${r.error?`\n<span class="er">${esc(r.error.type==="TooManyInputs"?"asked for another input":r.error.type+": "+r.error.msg)}</span>`:""}</pre></div>
-      <div><div class="lbl">Expected</div><pre class="term">${esc(t.expect)}</pre></div></div></div>`;
+      <div><div class="lbl">Expected</div><pre class="term">${esc(t.expect)}</pre></div></div>${given||wrote?`<div class="two">${given?`<div>${given}</div>`:""}${wrote?`<div>${wrote}</div>`:""}</div>`:""}</div>`;
   }).join("");
   const dots = pts.map(x=>`<i class="${x.ok?"y":"n"}"></i>`).join("");
   return {cls, got, of, html:`<div class="scorehead ${cls}"><span class="big">${got} / ${of}</span><span class="dots">${dots}</span><span class="lab">${lab}</span><span class="msg">${msg}</span></div>
-    ${firstErr?explainError(firstErr.r.error, src):""}
+    ${firstErr?(out.pc?`<div class="errbox"><b>Your pseudocode stopped</b> in the test “${esc(firstErr.t.label)}”.<div>${esc(firstErr.r.error.msg)}</div></div>`:explainError(firstErr.r.error, src)):""}
     <ul class="mps">${pts.map(x=>`<li class="mp ${x.ok?"ok":"no"}"><span class="ic">${x.ok?"✓":"✗"}</span><span><span class="mt">${x.t}<span class="ref">${x.ref}</span></span><br><span class="mf">${x.fb}</span></span></li>`).join("")}</ul>
     <details class="tests"${got<of?" open":""}><summary>🧪 What your program did in each test</summary><p class="muted" style="font-size:.88rem">We ran your code with Cambridge-style test data. ${testKindBlurb(a)}</p><div class="testgrid">${tests}</div></details>`};
 }
@@ -9480,12 +10933,12 @@ function ckPseudo(q, box, record, p, i, draft=NO_DRAFT){
     let pts;
     try { pts = q.mark(L, H, raw); }
     catch(e){ $(".result",box).innerHTML=`<div class="errbox"><b>This answer couldn't be marked.</b><div>Check it and try again.</div></div>`; return; }
-    const got = pts.filter(x=>x.ok).length;
+    const got = Math.min(q.marks, pts.filter(x=>x.ok).length);   // some schemes have more mark points than marks
     const py = L.some(l=>/\b(print|input)\s*\(|!=|==/.test(l.s));
     record(got);
     const [cls,lab] = band(got,q.marks);
     $(".result",box).innerHTML = `<div class="scorehead ${cls}" style="margin-top:12px"><span class="big">${got} / ${q.marks}</span><span class="lab">${lab}</span></div>
-      ${py?`<div class="fb hm">Some of this looks like Python. When a question asks for pseudocode, use Cambridge pseudocode: <code>OUTPUT</code>, <code>INPUT</code>, <code>←</code>, <code>&lt;&gt;</code>.</div>`:""}
+      ${q.maxNote?`<p class="muted" style="font-size:.88rem">${q.maxNote}</p>`:""}${py?`<div class="fb hm">Some of this looks like Python. When a question asks for pseudocode, use Cambridge pseudocode: <code>OUTPUT</code>, <code>INPUT</code>, <code>←</code>, <code>&lt;&gt;</code>.</div>`:""}
       <ul class="mps">${pts.map(x=>`<li class="mp ${x.ok?"ok":"no"}"><span class="ic">${x.ok?"✓":"✗"}</span><span><span class="mt">${x.t}<span class="ref">${x.ref}</span></span><br><span class="mf">${x.fb}</span></span></li>`).join("")}</ul>`;
     announceMark(got,q.marks);
     const m=$(".mdl",box); m.disabled=false; if (!$(".model",box).innerHTML) m.textContent="👀 Show model answer";
@@ -9497,7 +10950,7 @@ function ckPseudo(q, box, record, p, i, draft=NO_DRAFT){
   };
 }
 function ckErrors(q, box, record, p, i, draft=NO_DRAFT){
-  box.innerHTML = q.errors.map((_,j)=>`<div class="fields wide"><label style="max-width:110px">Error ${j+1}: line<input type="text" class="ln" placeholder="e.g. 3" maxlength="20" style="min-width:60px;width:80px"></label><label style="flex:1">Correction<input type="text" class="fx" maxlength="${FIELD_MAX}" style="width:100%"></label></div>`).join("") +
+  box.innerHTML = (q.errors.length>q.marks?`<p class="muted" style="font-size:.88rem">There are more errors than marks: find any ${q.marks}.</p>`:"") + Array.from({length:errFields(q)},(_,j)=>j).map(j=>`<div class="fields wide"><label style="max-width:110px">Error ${j+1}: line<input type="text" class="ln" placeholder="e.g. 3" maxlength="20" style="min-width:60px;width:80px"></label><label style="flex:1">Correction<input type="text" class="fx" maxlength="${FIELD_MAX}" style="width:100%"></label></div>`).join("") +
     `<button class="btn go chk">Mark my answer</button><div class="result"></div>`;
   const lnIns=[...box.querySelectorAll(".ln")], fxIns=[...box.querySelectorAll(".fx")], saved=draft.get();
   if (saved){ lnIns.forEach((x,j)=>x.value=saved.ln[j]||""); fxIns.forEach((x,j)=>x.value=saved.fx[j]||""); }
@@ -9505,6 +10958,25 @@ function ckErrors(q, box, record, p, i, draft=NO_DRAFT){
   $(".chk",box).onclick = ()=>{
     const lns=[...box.querySelectorAll(".ln")].map(x=>{ const m=x.value.trim().match(/^(?:line\s*)?(\d+)\.?$/i); return m?Number(m[1]):NaN; }), fxs=[...box.querySelectorAll(".fx")].map(x=>normTxt(x.value).replace(/<--?/g,"←").replace(/;\s*$/,""));
     const used=new Set(), pts=[];
+    if (q.errors.length>q.marks){
+      // "Identify five errors" from a longer list: each answer is matched to any error on that line.
+      const taken=new Set();
+      lns.forEach((l,k)=>{
+        if (isNaN(l)){ pts.push(H.no(`Error ${k+1}`,"","No line number given.")); return; }
+        const cands=q.errors.map((er,e)=>({er,e})).filter(x=>!taken.has(x.e)&&(x.er.line===l||(x.er.lines||[]).includes(l)));
+        if (!cands.length){ pts.push(H.no(`Error ${k+1}: line ${l}`,"",`Line ${l} doesn't contain one of the errors. Examiners noted candidates who “identified lines of codes as erroneous that were actually already correct”.`)); return; }
+        const fx=fxs[k].replace(/\s+/g," "), hit=cands.find(x=>x.er.test.test(fx));
+        if (hit){ taken.add(hit.e); used.add(k); pts.push(H.yes(`Error ${k+1}: line ${l} found and corrected`,"",`<code>${esc(hit.er.fix)}</code>. ${hit.er.why}`)); return; }
+        const c=cands[0], trap=(c.er.trap||[]).find(t=>t.re.test(fx)); used.add(k);
+        pts.push(H.no(`Error ${k+1}: line ${l}`,"", trap?trap.msg:`You found the right line, but the correction isn't right. ${c.er.why}`));
+      });
+      const got=Math.min(q.marks, pts.filter(x=>x.ok).length); record(got);
+      const [cls,lab]=band(got,q.marks);
+      $(".result",box).innerHTML = `<div class="scorehead ${cls}" style="margin-top:12px"><span class="big">${got} / ${q.marks}</span><span class="lab">${lab}</span></div>
+        <ul class="mps">${pts.map(x=>`<li class="mp ${x.ok?"ok":"no"}"><span class="ic">${x.ok?"✓":"✗"}</span><span><span class="mt">${x.t}</span><br><span class="mf">${x.fb}</span></span></li>`).join("")}</ul>`;
+      announceMark(got,q.marks);
+      return;
+    }
     q.errors.forEach(er=>{
       const j = lns.findIndex((l,k)=>l===er.line && !used.has(k));
       const title = `Line ${er.line}: ${er.fix}`;

@@ -1,7 +1,7 @@
 # Programming Skills website (pilot)
 
 Self-paced Learn → Practise → Apply → Checkpoint pages for every programming skill in Cambridge IGCSE CS 0984.
-Current release (11 Nov 2026): **Skills 1–19**, Worlds A–D: core building blocks (1–7), control structures (8–13), strings and library routines (14–15) and subroutines (16 Procedures, 17 Functions, 18 Local and global variables, 19 Maintainable programs). Skills 20–33 are marked Coming soon.
+Current release (11 Nov 2026): **Skills 1–22**, Worlds A–E: core building blocks (1–7), control structures (8–13), strings and library routines (14–15), subroutines (16–19) and data structures and files (20 1D arrays, 21 2D arrays, 22 File handling). Skills 23–33 are marked Coming soon.
 
 ## What's here
 - `index.html`: the whole website in one file. Open it in a browser or upload it to GitHub Pages.
@@ -23,8 +23,8 @@ Pupils paste code from their own editor. The page loads Python in the browser (P
 Each task's `mark()` function turns that into ✓/✗ mark points with spec references and feedback. Code never leaves the pupil's browser. A program that runs for longer than 8 seconds is stopped.
 
 ## Game layer (added 21 Oct 2026)
-- **XP** is worked out from saved progress, so repeating a question can't farm it: Learn 20; each Practise question 10 (+5 if right first time); each Apply mark point 10 (+30 for full marks); each automatically marked Checkpoint mark 15 (+10 for full marks). Self-marked reflections count towards completion but do not earn XP or streaks. Skills 1–19 have a maximum of **7860 XP** (plus 100 for each skip-ahead challenge passed).
-- **Levels**: Beginner 0, Explorer 60, Builder 150, Coder 280, Debugger 450, Developer 650, Pro 900, Ace 1200, Expert 1600, Architect 2100, Master 2700, Champion 3400, Grandmaster 4300, Hero 5000, Legend 5800, Mythic 6800 XP. Add a level whenever a new world takes the maximum past the top one.
+- **XP** is worked out from saved progress, so repeating a question can't farm it: Learn 20; each Practise question 10 (+5 if right first time); each Apply mark point 10 (+30 for full marks); each automatically marked Checkpoint mark 15 (+10 for full marks). Self-marked reflections count towards completion but do not earn XP or streaks. Skills 1–22 have a maximum of **9350 XP** (plus 100 for each skip-ahead challenge passed).
+- **Levels**: Beginner 0, Explorer 60, Builder 150, Coder 280, Debugger 450, Developer 650, Pro 900, Ace 1200, Expert 1600, Architect 2100, Master 2700, Champion 3400, Grandmaster 4300, Hero 5000, Legend 5800, Mythic 6800, Titan 8000 XP. Add a level whenever a new world takes the maximum past the top one.
 - **Streak**: correct answers in a row (Practise, Checkpoint, full-marks Apply). A wrong answer on an unfinished Practise or Apply task resets it. Repeating a solved task does not increase it.
 - **11 badges**, shown on the home page (including 🚀 Fast track for passing a skip-ahead challenge).
 - **Locks**: Practise opens after Learn; Apply after every Practise question is right; Checkpoint after every Apply task reaches “Nearly there” (60%+); the next skill after the previous skill's Checkpoint.
@@ -99,6 +99,20 @@ Skills 16–19 live in their own files, `source/src/worldD-s16.js` … `worldD-s
 - `starterCaption` on an Apply task changes the caption above its starter code. Skip-ahead coding tasks never use a task with starter code.
 - **Audit (11 Nov 2026):** three independent reviews (content accuracy against the spec and mark schemes, security, fairness of marking). All confirmed issues were fixed; `source/test/worldD-regression.js` replays them.
 
+## World E: data structures and files (added 11 Nov 2026)
+Skills 20–22 are in `source/src/worldE-s20.js` … `worldE-s22.js`.
+
+- **Skill 20 1D arrays:** declaring `ARRAY[1:n]`, 1-based pseudocode vs 0-based Python, a variable as the index, filling and reading with loops. Apply (Python): "Squad list" (five names into a list with a loop, numbered output printed by a loop); "Level select" (list of five levels, `levels[number - 1]`, rejects 0, 6, 7 and -1; levels 2 and 4 are tested too). Checkpoint: June 2025 P21 Q3 (rewrite with a condition-controlled loop, run), June 2025 P22 Q5(a) (five errors), exam-style declare-and-zero 30 elements (run).
+- **Skill 21 2D arrays:** `ARRAY[1:r, 1:c]`, `Grid[Row, Column]`, lists of lists, nested loops, the `[[...]*3]*3` trap. Apply (Python): "Noughts and crosses" (place X, print the board with a loop; corner tests catch swapped indexes); "Scoreboard" (input inside nested loops into a 2D list). Checkpoint: November 2025 P22 Q2(b)(i) NewData (run; MP2 needs the identifier Number), November 2025 P22 Q2(a) (**any five of six** errors), exam-style trace.
+- **Skill 22 File handling:** reasons for files, OPENFILE/READFILE/WRITEFILE/CLOSEFILE, WRITE wipes a file, reading several lines using a count on the first line. **Apply tasks are pseudocode (Ahsan's choice)**, run against virtual files: "Save the high score" (HighScore.txt) and "Read the team sheet" (Team.txt, 2, 3 and 5 players). Quotation marks round file names earn a mark (a variable holding the name is fine). Checkpoint: June 2026 P21 Q5(c) (missing quotes or wrong name "penalise once"), June 2024 P21 Q7(b) (five mark points, max 4), November 2024 P22 Q10 (nine mark points, max 6); the 2024 schemes accept unquoted names, with a tip.
+
+### Checker features added for World E
+- **Pseudocode Apply tasks** (`lang:"pc"` on a task, optional `files` shown in the brief, tests with `files:{name:[lines]}`): `pcCheck()` runs each test through `PC.run`; unreadable lines are listed ("Not run yet") before running; test cards show the files at the start and afterwards (trimmed). Skip-ahead coding tasks never use pseudocode tasks.
+- **`pseudo.js`:** 1D/2D arrays (bounds checked, uninitialised reads reported, `Name[i][j]` flagged), files (quoted, bare or variable names; names match whatever the capitals; READ needs an existing file; WRITE starts empty; reading past the end is an error), `res.events`, `res.files`, `res.fileOps`, `res.stillOpen`, `res.cell()`, `arrays` option for pre-populated arrays, `prog.nextErrors` when NEXT names the wrong counter. Limits: 10,000-character strings, 100-character file names, 5,000 file operations, 2,000 lines per file, 100,000 array cells.
+- **Harness:** `info.listNames`, `lists2d`, `subscripts`, `subscripts2`, `listLiterals`, `printCount`, `printInLoop`, and `inputs[].inLoop`/`loopDepth` (comprehensions count as loops). Output events now record which print call and which source line wrote them; `H.outLines`, `H.loopPrinted` (were these lines printed by a loop?) and `H.afterInput` use this.
+- **Checkpoints:** errors questions can list more errors than marks ("find any N"; an error may accept several `lines`); pseudocode scores are capped at the question's marks (`maxNote` explains), so schemes with extra mark points work.
+- **Audit (11 Nov 2026):** three independent reviews again (content, security, marking fairness); all confirmed issues fixed and replayed in `source/test/worldE-regression.js` (92 checks).
+
 ## Adding the next skill
 Create `source/src/world<Letter>-s<N>.js` with `SKILLS.sN = {...}` (same shape as the World D files), then set the 4th item of its row in `SKILL_MAP` to `"sN"` only once the skill exists. Use call tests for function tasks, labelled numbers rather than "last number printed", boundary tests, and varied MCQ answers. Check pseudocode against the 0984 guide (not 9618) and mark pseudocode checkpoints by running them with `H.pcRun` where possible. Rebuild, run every suite, update the XP totals in `test/adversarial.js` and the world list in `test/fasttrack.js`, and add a level if the maximum XP passes the top one.
 
@@ -125,7 +139,7 @@ node source/test/teacher-gate.js # ?teacher needs a teacher sign-in; students st
 node source/test/adversarial.js # sandbox escapes, forged saves, hostile drafts (exits non-zero on failure)
 node source/test/checkpoints.js # every Checkpoint question's correct answer scores full marks (Skills 2–19)
 node source/test/worldB-smoke.js # every Apply model answer full marks, off-task 0, hard-coded output never full marks (Skills 8–19)
-node source/test/worldB-regression.js; node source/test/worldC-regression.js; node source/test/worldD-regression.js # each world's audit cases
+node source/test/worldB-regression.js; node source/test/worldC-regression.js; node source/test/worldD-regression.js; node source/test/worldE-regression.js # each world's audit cases
 ```
 
 Set `PLAYWRIGHT_CHANNEL=chrome` to select installed Google Chrome if needed. `experience.js` downloads axe-core from jsDelivr; set `AXE_PATH` to a local `axe.min.js` to run it offline. The browser tests need internet access for Pyodide. See `AUDIT.md` for the findings and residual limitations.
