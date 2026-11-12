@@ -553,10 +553,26 @@ figure.code.pc figcaption{background:var(--blue-f);color:var(--on-f)}
 .filehead{font-size:.82rem;font-weight:800;color:var(--ink-2);margin-bottom:2px}
 .filebox .term{margin:0}
 
+/* ---------- required sign-in: welcome page ---------- */
+body.signedout #hud, body.signedout #acctbtn{display:none}
+.welcome{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(300px,440px);gap:28px;align-items:center;padding:36px 0 24px}
+.welcome h1{font-size:clamp(2rem,4.5vw,3rem);line-height:1.05;background:linear-gradient(90deg,var(--violet),var(--pink));-webkit-background-clip:text;background-clip:text;color:transparent}
+.welcometext p{font-size:1.08rem;color:var(--ink-2);max-width:56ch}
+.welcomebox h2{margin:0 0 4px}
+@media (max-width:820px){.welcome{grid-template-columns:1fr;padding-top:18px}}
+
+/* ---------- teacher dashboard button ---------- */
+.teacherbtn{flex:none;display:inline-flex;align-items:center;gap:4px;height:40px;padding:0 12px;border-radius:12px;border:2px solid var(--rule-2);background:var(--paper);color:var(--ink);font-weight:800;font-size:.92rem;text-decoration:none;box-shadow:0 3px 0 var(--rule-2)}
+.teacherbtn.on{background:var(--violet-w);border-color:var(--violet)}
+.teacherbtn[hidden]{display:none}
+@media (max-width:620px){.teacherbtn .tbtxt{display:none}.teacherbtn{padding:0 10px}}
+/* Teachers on a phone: make room for the dashboard button by dropping the level title/bar. */
+@media (max-width:420px){body:has(#teacherbtn:not([hidden])) .hud .hudmid{display:none}}
+
 </style>
 </head>
 <body>
-<header class="top"><div class="wrap"><a class="brand" href="#"><span class="logo">{ }</span><span>Programming Skills<small>Cambridge IGCSE CS 0984</small></span></a><span class="spacer"></span><button id="acctbtn" class="acctbtn out" type="button" aria-label="Sign in to save your progress">👤<span class="acctname"> Sign in</span></button><button id="themebtn" class="themebtn" type="button" aria-label="Switch colour theme" title="Switch between light and dark">🌙</button><div id="hud" class="hud"><span class="lvl">1</span><span class="hudmid"><span class="hudtitle">Beginner</span><span class="xpbar"><i style="width:0%"></i></span><span class="xptxt">0 XP · 60 to level 2</span></span><span class="streak">🔥 0</span></div></div></header>
+<header class="top"><div class="wrap"><a class="brand" href="#"><span class="logo">{ }</span><span>Programming Skills<small>Cambridge IGCSE CS 0984</small></span></a><span class="spacer"></span><a id="teacherbtn" class="teacherbtn" href="#teacher" hidden>📊<span class="tbtxt"> Dashboard</span></a><button id="acctbtn" class="acctbtn out" type="button" aria-label="Sign in to save your progress">👤<span class="acctname"> Sign in</span></button><button id="themebtn" class="themebtn" type="button" aria-label="Switch colour theme" title="Switch between light and dark">🌙</button><div id="hud" class="hud"><span class="lvl">1</span><span class="hudmid"><span class="hudtitle">Beginner</span><span class="xpbar"><i style="width:0%"></i></span><span class="xptxt">0 XP · 60 to level 2</span></span><span class="streak">🔥 0</span></div></div></header>
 <div class="wrap"><p id="previewnotice" class="note" hidden>Teacher preview: stages are unlocked. XP, streaks and badges are disabled; student progress is not saved or changed. <a href="?">Return to student mode</a></p><p id="teacherneeded" class="note" hidden>Teacher preview needs a teacher login. <button class="btn small primary" type="button" data-signin>Sign in</button> with your teacher account in this tab and the preview opens.</p><p id="savewarning" class="errbox" role="alert" hidden>Progress could not be saved in this browser. Keep this tab open and copy your progress before leaving.</p></div>
 <main class="wrap" id="app"></main>
 <div id="announcer" class="sr-only" role="status" aria-live="polite"></div>
@@ -1175,6 +1191,7 @@ def check(src, tests_json):
 
 </script>
 <script>
+const TEACHER_JS = "teacher.js?v=d77e987e2b";
 /* ============================================================
    CONTENT — the skill map and the two pilot skills.
    Every item carries its 0984 spec reference.
@@ -8844,24 +8861,23 @@ const CLOUD = (()=>{
     return {m, close};
   }
 
-  function openAccount(){
-    if (TEACHER) return;
-    if (session) return accountDialog();
-    const {m} = dialog(`
-      <h2 id="acct-h">Sign in</h2>
-      <p>Use the username and password your teacher gave you. Your progress is then saved to your account, so you can carry on from any computer.</p>
+  // The sign-in form, used in the pop-up and on the welcome page (sign-in is required to use the site).
+  function signInHTML(withCancel){
+    return `
       <form class="acctform" novalidate>
         <label>Username<input type="text" name="u" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="40"></label>
         <label>Password<span class="pwrow"><input type="password" name="p" autocomplete="current-password" maxlength="72"><button class="btn small pwshow" type="button" aria-pressed="false">Show</button></span></label>
         <label class="chk"><input type="checkbox" name="r"><span>Keep me signed in on this computer<small>Only tick this on your own device.</small></span></label>
         <p class="errbox" role="alert" hidden></p>
         <button class="btn primary big wide" type="submit">Sign in</button>
-        <button class="btn wide" type="button" data-close>Cancel</button>
+        ${withCancel ? `<button class="btn wide" type="button" data-close>Cancel</button>` : ""}
       </form>
-      <p class="muted small">Forgotten your password? Ask your teacher to reset it.</p>`);
-    const form = m.querySelector("form"), err = m.querySelector(".errbox"), btn = form.querySelector("[type=submit]");
+      <p class="muted small">Forgotten your password? Ask your teacher to reset it.</p>`;
+  }
+  function wireSignIn(root, focus){
+    const form = root.querySelector("form"), err = root.querySelector(".errbox"), btn = form.querySelector("[type=submit]");
     const fail = msg => { err.textContent = msg; err.hidden = false; btn.disabled = false; btn.textContent = "Sign in"; };
-    form.u.focus();
+    if (focus) form.u.focus();
     const pw = form.querySelector(".pwshow");
     pw.onclick = () => { const show = form.p.type==="password"; form.p.type = show ? "text" : "password"; pw.textContent = show ? "Hide" : "Show"; pw.setAttribute("aria-pressed", String(show)); };
     form.onsubmit = async e => {
@@ -8875,7 +8891,7 @@ const CLOUD = (()=>{
       try { r = await auth("token?grant_type=password", {email: `${u}@${CLOUD_DOMAIN}`, password: p}); }
       catch(e){ return fail("Can't reach the server. Check your internet connection and try again."); }
       if (!r.ok || !r.data || !r.data.user) return fail(r.status===429 ? "Too many attempts. Wait a minute, then try again."
-        : r.status===400 ? "That username and password don't match. Check them and try again." : "Sign-in isn't working right now. Try again soon.");
+        : r.status===400 ? "That username and password don't match. Check them and try again." : "Sign-in isn't working right now. Try again soon, or tell your teacher.");
       session = null;
       adopt(r.data, {username: u, name: "", remember: form.r.checked});
       try {
@@ -8895,6 +8911,29 @@ const CLOUD = (()=>{
       q.m.querySelector("[data-yes]").focus();
     };
   }
+  function openAccount(){
+    if (TEACHER) return;
+    if (session) return accountDialog();
+    const {m} = dialog(`
+      <h2 id="acct-h">Sign in</h2>
+      <p>Use the username and password your teacher gave you. Your progress is then saved to your account, so you can carry on from any computer.</p>
+      ${signInHTML(true)}`);
+    wireSignIn(m, true);
+  }
+  function renderSignIn(el){ el.innerHTML = signInHTML(false); wireSignIn(el, true); }
+
+  // Teacher role, read from the sign-in token (set only by the teacher tool). The page uses it to show the
+  // dashboard; the database decides what data a login may read, whatever the page does.
+  function isTeacher(){
+    if (!session) return false;
+    try {
+      const part = session.access_token.split(".")[1].replace(/-/g,"+").replace(/_/g,"/");
+      const c = JSON.parse(atob(part + "===".slice((part.length+3)%4)));
+      return !!(c && c.app_metadata && c.app_metadata.role==="teacher");
+    } catch(e){ return false; }
+  }
+  // Read-only queries for the teacher dashboard (GET only; database rules limit them to teacher logins).
+  const teacherGet = path => isTeacher() ? rest(path) : Promise.reject(new Error("not a teacher"));
 
   function accountDialog(){
     const {m} = dialog(`
@@ -8951,7 +8990,7 @@ const CLOUD = (()=>{
     run();
   }
 
-  return {storeKey, queue, start, openAccount, signedIn: () => !!session, who, username: () => session ? session.username : ""};
+  return {storeKey, queue, start, openAccount, renderSignIn, isTeacher, teacherGet, uid: () => session ? session.uid : null, status: () => status, signedIn: () => !!session, who, username: () => session ? session.username : ""};
 })();
 
 /* ============================================================
@@ -10048,12 +10087,60 @@ function termHTML(parts){
 }
 
 
+/* ---------- required sign-in ---------- */
+// Every student signs in, so all their work reaches the teacher dashboard.
+// EMERGENCY SWITCH: if Supabase is down or paused and students can't sign in, set this to false,
+// rebuild (node source/build.js) and publish. The site then works without accounts, saving in each browser.
+const REQUIRE_SIGNIN = true;
+// Automated tests that don't test sign-in set window.__psTestGuest before the page loads.
+function needsSignIn(){ return REQUIRE_SIGNIN && !TEACHER && !CLOUD.signedIn() && !window.__psTestGuest; }
+function renderWelcome(){
+  const expired = CLOUD.status()==="expired";
+  $("#app").innerHTML = `
+    <section class="welcome">
+      <div class="welcometext">
+        <h1>Level up your programming</h1>
+        <p>Every programming skill in Cambridge IGCSE Computer Science 0984: learn it, practise it, write real Python, and get feedback marked against the specification.</p>
+        <div class="loop"><span class="c-blue">📖 Learn</span><span class="c-orange">✏️ Practise</span><span class="c-violet">💻 Apply</span><span class="c-pink">🎓 Checkpoint</span></div>
+      </div>
+      <div class="panel welcomebox">
+        <h2>${expired ? "Sign in again" : "Sign in to start"}</h2>
+        <p class="muted">${expired ? "You were signed out. Your work on this computer is kept and saves to your account when you sign in." : "Use the username and password your teacher gave you. Don't have one yet? Ask your teacher."}</p>
+        <div id="welcomeform"></div>
+      </div>
+    </section>`;
+  CLOUD.renderSignIn($("#welcomeform"));
+}
+
+/* ---------- teacher dashboard (loaded only for teacher logins) ---------- */
+let teacherLoad = null;
+function openTeacher(){
+  if (!CLOUD.isTeacher()){
+    $("#app").innerHTML = `<section class="panel lockpanel"><div class="mbig">🔒</div><h1>Teacher dashboard</h1><p>This page is for teacher logins only.</p><a class="btn primary big" href="#">Back to all skills</a></section>`;
+    return;
+  }
+  if (typeof renderTeacher==="function") return renderTeacher();
+  $("#app").innerHTML = `<section class="panel"><p class="muted">Loading the dashboard…</p></section>`;
+  teacherLoad ||= new Promise((ok, no)=>{ const sc=document.createElement("script"); sc.src=TEACHER_JS; sc.onload=ok; sc.onerror=()=>{ teacherLoad=null; sc.remove(); no(); }; document.head.appendChild(sc); });
+  teacherLoad.then(()=>{ if (location.hash.startsWith("#teacher")) renderTeacher(); })
+    .catch(()=>{ if (location.hash.startsWith("#teacher")) $("#app").innerHTML = `<section class="panel"><p class="errbox">The dashboard couldn't load. Check your internet connection and refresh the page.</p></section>`; });
+}
+function paintTeacherButton(){
+  const b=document.getElementById("teacherbtn"); if (!b) return;
+  b.hidden = TEACHER || !CLOUD.isTeacher();
+  b.classList.toggle("on", location.hash.startsWith("#teacher"));
+}
+
 /* ---------- routing ---------- */
 function route(moveFocus){
   flushDrafts();
   document.querySelectorAll(".modal").forEach(m=>{ if(m.dataset.route!==location.hash) (m.dismiss ? m.dismiss({restore:false}) : m.remove()); });
   const [id, st] = (location.hash.slice(1)||"").split("/");
-  if (id==="fast") renderFast(st);
+  document.body.classList.toggle("signedout", needsSignIn());
+  paintTeacherButton();
+  if (needsSignIn()) renderWelcome();
+  else if (id==="teacher") openTeacher();
+  else if (id==="fast") renderFast(st);
   else if (Object.hasOwn(SKILLS,id)){
     const lock = skillLock(id);
     if (lock){ toast(`🔒 ${lock}`, "lock"); history.replaceState(null,"","#"); renderHome(); }
