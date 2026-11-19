@@ -4,7 +4,7 @@
    lets only teacher logins do this) and works out the numbers with the SAME
    functions the student site uses (xpTotal, skillPct, stageDone…), so a
    student's figures always match what they see.
-   Routes: #teacher · #teacher/student/<id> · #teacher/questions · #teacher/history
+   Routes: #teacher · #teacher/student/<id> · #teacher/questions · #teacher/history · #teacher/manage
    History (Phase 2) comes from progress_daily, which the database fills itself (002_history.sql).
    ============================================================ */
 (()=>{
@@ -83,6 +83,29 @@ table.tlist{border-collapse:collapse;width:100%;font-size:.9rem;margin:6px 0 12p
 .tstrip i.on{background:var(--violet);border-color:var(--violet)}
 .tstrip i.base{background:var(--violet-w);border-color:var(--violet-w)}
 .tdone td.by{color:var(--ink-2);font-style:italic}
+.tmsg{margin:0 0 12px;padding:10px 14px;border-radius:12px;font-weight:800;background:var(--green-w);color:var(--green-d)}
+.tmsg.bad{background:var(--red-w);color:var(--red)}
+.tmsg:empty{display:none}
+.tform{display:flex;flex-wrap:wrap;gap:8px;align-items:end;margin-top:10px}
+.tform label{display:grid;gap:4px;font-weight:800;font-size:.9rem}
+.tform input,.tform select,.tadd textarea{font:inherit;padding:7px 10px;border-radius:12px;border:2px solid var(--rule-2);background:var(--paper);color:var(--ink)}
+.tadd textarea{width:100%;min-height:130px;resize:vertical;box-sizing:border-box}
+.tbulk{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 10px;border-radius:12px;background:var(--wash);margin-bottom:10px}
+.tbulk select{font:inherit;font-weight:700;padding:6px 8px;border-radius:10px;border:2px solid var(--rule-2);background:var(--paper);color:var(--ink)}
+.tacts{display:flex;flex-wrap:wrap;gap:6px}
+.tgridwrap .tacts{flex-wrap:nowrap}
+.tgridwrap td{white-space:nowrap}
+.btn.danger{border-color:color-mix(in srgb,var(--red) 55%,transparent);color:var(--red)}
+.tlogins{border-color:var(--amber)}
+.tlogins td.pw{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:800;font-size:1rem}
+.tslips{display:none}
+@media print{
+  body *{visibility:hidden !important}
+  .tslips,.tslips *{visibility:visible !important}
+  .tslips{display:grid !important;position:absolute;left:0;top:0;width:100%;grid-template-columns:1fr 1fr;gap:10px}
+  .tslip{border:1.5px dashed #555;border-radius:8px;padding:12px 14px;break-inside:avoid;color:#000;background:#fff;font-size:12pt}
+  .tslip b{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13pt}
+}
 `;
 if (!document.getElementById("teachercss")){ const st=document.createElement("style"); st.id="teachercss"; st.textContent=CSS; document.head.appendChild(st); }
 
@@ -104,7 +127,9 @@ function flagSettings(){
 
 /* ---------- data ---------- */
 const S = {roster:null, loadedAt:0, loading:null, error:null, sort:store.get("ps-teacher-sort",{key:"name",dir:1}),
-           act:null, histErr:null, weekly:null, tl:new Map()};
+           act:null, histErr:null, weekly:null, tl:new Map(),
+           classes:null, archived:[], manageErr:null, sel:new Set(), newLogins:null, msg:null};
+const NO_CLASS = "No class", TEST_CLASS = "TEST";        // TEST holds the automated tests' logins: hidden here
 const DAY = 864e5;
 
 /* ---------- history (Phase 2: progress_daily, written by the database on every save) ---------- */
@@ -144,18 +169,22 @@ async function load(force){
   S.loading = (async()=>{
     try {
       const [people, rows] = await Promise.all([
-        CLOUD.teacherGet("students?select=id,username,display_name,class_name,is_teacher&order=display_name.asc"),
+        CLOUD.teacherGet("students?select=*&order=display_name.asc"),
         CLOUD.teacherGet("progress?select=user_id,data,updated_at"),
-        loadActivity().then(a=>{ S.act = a; S.histErr = null; }, e=>{ S.act = null; S.histErr = histMessage(e); })
+        loadActivity().then(a=>{ S.act = a; S.histErr = null; }, e=>{ S.act = null; S.histErr = histMessage(e); }),
+        CLOUD.teacherGet("classes?select=name&order=name.asc").then(r=>{ S.classes = (r||[]).map(c=>c.name).filter(n=>n!==TEST_CLASS); S.manageErr = null; },
+          e=>{ S.classes = null; S.manageErr = /http 404/.test(e.message) ? "Class and student management isn't switched on yet. Run source/supabase/003_manage.sql and deploy the teacher-admin function (see the README)." : "Couldn't load the class list. Try Refresh."; })
       ]);
       S.weekly = null; S.tl.clear();
       const byId = new Map((rows||[]).map(r=>[r.user_id, r]));
-      S.roster = (people||[]).filter(p=>!p.is_teacher && !/^test\./.test(p.username)).map(p=>{
+      const all = (people||[]).filter(p=>!p.is_teacher && !/^test\./.test(p.username)).map(p=>{
         const row = byId.get(p.id), prog = cleanProgress(row ? row.data : {});
         const updated = row && row.updated_at ? new Date(row.updated_at) : null;
-        return {id:p.id, username:p.username, name:p.display_name || p.username, cls:p.class_name || "No class",
-                hasRow:!!row, updated, prog, st:stats(prog)};
+        return {id:p.id, username:p.username, name:p.display_name || p.username, cls:p.class_name || NO_CLASS, realCls:p.class_name || null,
+                archivedAt:p.archived_at ? new Date(p.archived_at) : null, hasRow:!!row, updated, prog, st:stats(prog)};
       });
+      S.roster = all.filter(s=>!s.archivedAt);            // archived students only appear under Manage
+      S.archived = all.filter(s=>s.archivedAt);
       S.loadedAt = Date.now(); S.error = null;
     } catch(e){
       S.error = /signed out/.test(e.message) ? "You've been signed out. Sign in again to see the dashboard." : "Couldn't load student data. Check your internet connection and try Refresh. (If it keeps failing, the Supabase project may be paused: restore it from the Supabase dashboard.)";
@@ -205,7 +234,7 @@ function flagsFor(stu, median, F){
 }
 
 /* ---------- helpers ---------- */
-const classes = () => [...new Set(S.roster.map(s=>s.cls))].sort((a,b)=>a.localeCompare(b, "en-GB", {numeric:true}));
+const classes = () => [...new Set([...S.roster.map(s=>s.cls), ...(S.classes||[])])].filter(c=>c!==TEST_CLASS).sort((a,b)=>a.localeCompare(b, "en-GB", {numeric:true}));
 function currentClass(){
   const list = classes(), saved = store.get("ps-teacher-class", null);
   return saved==="*" || list.includes(saved) ? saved : (list[0] || "*");
@@ -225,7 +254,7 @@ function header(tab, cls){
   const opts = classes().map(c=>`<option value="${esc(c)}" ${c===cls?"selected":""}>${esc(c)}</option>`).join("");
   return `<div class="ttop">
     <h1>📊 Teacher dashboard</h1>
-    <nav class="ttabs" aria-label="Dashboard views"><a href="#teacher" class="${tab==="class"?"on":""}">Class overview</a><a href="#teacher/questions" class="${tab==="questions"?"on":""}">Question analysis</a><a href="#teacher/history" class="${tab==="history"?"on":""}">History</a></nav>
+    <nav class="ttabs" aria-label="Dashboard views"><a href="#teacher" class="${tab==="class"?"on":""}">Class overview</a><a href="#teacher/questions" class="${tab==="questions"?"on":""}">Question analysis</a><a href="#teacher/history" class="${tab==="history"?"on":""}">History</a><a href="#teacher/manage" class="${tab==="manage"?"on":""}">Manage</a></nav>
     <span class="spacer"></span>
     <div class="tctl">
       <label>Class <select id="tclass"><option value="*" ${cls==="*"?"selected":""}>All classes</option>${opts}</select></label>
@@ -588,6 +617,146 @@ function renderQuestions(cls){
   };
 }
 
+/* ---------- manage classes and students (Phase 4) ----------
+   Reads come from the database as usual; every change goes through CLOUD.teacherAdmin → the teacher-admin
+   Edge Function, which checks the teacher login, only touches student logins and logs each action.
+   New passwords are kept only in memory (S.newLogins) until "Done" or a page reload. */
+const SITE_URL = "https://ahsan753.github.io/programming-skills/";
+function loginsPanel(){
+  const L = S.newLogins; if (!L) return "";
+  const rows = L.list.map(x=>`<tr><td>${esc(x.name)}</td><td>${esc(x.cls||NO_CLASS)}</td><td>${esc(x.username)}</td><td class="pw">${esc(x.password)}</td></tr>`).join("");
+  const slips = L.list.map(x=>`<div class="tslip"><div>🧩 Programming Skills · ${esc(x.cls||"")}</div><div style="font-size:14pt;font-weight:800;margin:4px 0">${esc(x.name)}</div>
+      <div>Website: ${esc(SITE_URL)}</div><div>Username: <b>${esc(x.username)}</b></div><div>Password: <b>${esc(x.password)}</b></div></div>`).join("");
+  return `<section class="panel tlogins"><h2>🔑 ${esc(L.title)}: shown once</h2>
+    <p>Print, copy or download these now. They can't be shown again; if one gets lost, reset that student's password.</p>
+    ${L.problems && L.problems.length ? `<p class="errbox">Not created: ${L.problems.map(p=>`${esc(p.name||"(blank)")}: ${esc(p.error)}`).join("; ")}</p>` : ""}
+    ${L.list.length ? `<table class="tlist"><thead><tr><th>Name</th><th>Class</th><th>Username</th><th>Password</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="tacts"><button class="btn primary" type="button" id="tprint">🖨 Print login slips</button><button class="btn" type="button" id="tlogcsv">⬇ Download (Excel/CSV)</button><button class="btn" type="button" id="tdone">Done: hide passwords</button></div>` : `<div class="tacts"><button class="btn" type="button" id="tdone">OK</button></div>`}
+    <div class="tslips" id="tslips">${slips}</div></section>`;
+}
+
+function renderManage(cls){
+  if (!S.classes){
+    $("#app").innerHTML = `<div class="tdash">${header("manage", cls)}<section class="panel"><h2>⚙️ Manage classes and students</h2><p class="errbox">${esc(S.manageErr || "Not available.")}</p></section></div>`;
+    wireHeader(); return;
+  }
+  const people = [...S.roster].filter(s=>cls==="*" || s.cls===cls).sort((a,b)=>a.name.localeCompare(b.name));
+  const names = new Set(people.map(s=>s.username));
+  for (const u of [...S.sel]) if (!names.has(u)) S.sel.delete(u);                      // selection only covers what's on screen
+  const count = c => S.roster.filter(s=>s.realCls===c).length;
+  const clsOpts = (selected, withNone=true) => (withNone ? `<option value="" ${selected===null?"selected":""}>${NO_CLASS}</option>` : "") + S.classes.map(c=>`<option value="${esc(c)}" ${c===selected?"selected":""}>${esc(c)}</option>`).join("");
+  const addDefault = cls!=="*" && cls!==NO_CLASS ? cls : null;
+  const label = cls==="*" ? "all classes" : cls;
+
+  const classRows = S.classes.map(c=>`<tr><td><a href="#teacher/manage" data-pick="${esc(c)}">${esc(c)}</a></td><td class="num">${count(c)}</td>
+      <td><div class="tacts"><button class="btn small" type="button" data-rename-class="${esc(c)}">Rename</button><button class="btn small danger" type="button" data-delete-class="${esc(c)}">Delete</button></div></td></tr>`).join("");
+  const noClass = S.roster.filter(s=>!s.realCls).length;
+  const stuRows = people.map(s=>`<tr><td><input type="checkbox" data-sel="${esc(s.username)}" aria-label="Select ${esc(s.name)}" ${S.sel.has(s.username)?"checked":""}></td>
+      <td><a href="#teacher/student/${s.id}">${esc(s.name)}</a></td><td>${esc(s.username)}</td>${cls==="*"?`<td>${esc(s.cls)}</td>`:""}<td title="${esc(stamp(s.updated))}">${when(s.updated)}</td>
+      <td><div class="tacts"><button class="btn small" type="button" data-reset="${esc(s.username)}">Reset password</button><button class="btn small" type="button" data-rename="${esc(s.username)}" data-name="${esc(s.name)}">Rename</button><button class="btn small danger" type="button" data-archive="${esc(s.username)}" data-name="${esc(s.name)}">Archive</button></div></td></tr>`).join("");
+  const archRows = S.archived.sort((a,b)=>a.name.localeCompare(b.name)).map(s=>`<tr><td>${esc(s.name)}</td><td>${esc(s.username)}</td><td>${esc(s.cls)}</td><td>${esc(stamp(s.archivedAt))}</td>
+      <td><div class="tacts"><button class="btn small" type="button" data-restore="${esc(s.username)}">Restore</button><button class="btn small danger" type="button" data-delete="${esc(s.username)}" data-name="${esc(s.name)}">Delete permanently</button></div></td></tr>`).join("");
+
+  $("#app").innerHTML = `<div class="tdash">${header("manage", cls)}
+    <p class="tmsg ${S.msg && S.msg.bad ? "bad" : ""}" id="tmsg" role="status" aria-live="polite">${S.msg ? esc(S.msg.text) : ""}</p>
+    ${loginsPanel()}
+    <section class="panel"><h2>🏫 Classes</h2>
+      ${S.classes.length ? `<table class="tlist"><thead><tr><th>Class</th><th class="num">Students</th><th>Change</th></tr></thead><tbody>${classRows}</tbody></table>` : `<p class="tempty">No classes yet. Add one below.</p>`}
+      ${noClass ? `<p class="muted">${noClass} student${noClass===1?"":"s"} in ${NO_CLASS}.</p>` : ""}
+      <form class="tform" id="tnewclass"><label>New class name<input name="n" maxlength="30" required placeholder="e.g. 10C" autocomplete="off"></label><button class="btn primary" type="submit">Add class</button></form>
+      <p class="muted" style="font-size:.85rem">Deleting a class moves its students to ${NO_CLASS}; their logins and work are kept.</p>
+    </section>
+    <section class="panel"><h2>👥 Students in ${esc(label)}</h2>
+      <p class="muted" style="font-size:.85rem">Change class with the Class menu at the top. Tick students to move, reset or archive several at once.</p>
+      ${people.length ? `<div class="tbulk"><b id="tselcount">${S.sel.size} selected</b>
+          <label>Move to <select id="tmoveto">${clsOpts(addDefault)}</select></label><button class="btn small" type="button" id="tmove">Move</button>
+          <button class="btn small" type="button" id="tresetsel">Reset passwords</button><button class="btn small danger" type="button" id="tarchsel">Archive</button></div>
+        <div class="tgridwrap" style="max-height:none"><table class="tlist" style="margin:0"><thead><tr><th><input type="checkbox" id="tselall" aria-label="Select all" ${S.sel.size && S.sel.size===people.length?"checked":""}></th><th>Name</th><th>Username</th>${cls==="*"?"<th>Class</th>":""}<th>Last active</th><th>Change</th></tr></thead><tbody>${stuRows}</tbody></table></div>`
+        : `<p class="tempty">No students here yet. Add them below.</p>`}
+    </section>
+    <section class="panel tadd"><h2>➕ Add students</h2>
+      <p>One student per line. To choose a username, add it after a comma, for example <code>Ali Khan, ali.k</code>. Otherwise it's made from the name. Up to 40 at a time.</p>
+      <textarea id="taddnames" aria-label="Student names, one per line" placeholder="Ali Khan&#10;Sara Lopez&#10;Tom Lee, tom.l"></textarea>
+      <div class="tform"><label>Class <select id="taddcls">${clsOpts(addDefault)}</select></label><button class="btn primary" type="button" id="tadd">Create logins</button></div>
+    </section>
+    <section class="panel"><h2>🗄 Archived students (${S.archived.length})</h2>
+      <p class="muted" style="font-size:.85rem">Archived students can't sign in or save, and don't appear in the dashboard, but their work is kept. Restore brings them back as they were. Deleting permanently removes the login, all work and history, and can't be undone.</p>
+      ${S.archived.length ? `<table class="tlist"><thead><tr><th>Name</th><th>Username</th><th>Class</th><th>Archived</th><th>Change</th></tr></thead><tbody>${archRows}</tbody></table>` : `<p class="tempty">Nobody is archived.</p>`}
+    </section>
+  </div>`;
+  S.msg = null;
+  wireHeader();
+
+  const say = (text, bad) => { const m = $("#tmsg"); if (m){ m.textContent = text; m.classList.toggle("bad", !!bad); } };
+  async function run(action, body, done){
+    const btns = [...document.querySelectorAll(".tdash button")]; btns.forEach(b=>b.disabled = true);
+    say("Working…");
+    try {
+      const r = await CLOUD.teacherAdmin(action, body);
+      S.msg = {text: done(r)}; S.sel.clear();
+      if (r.created) S.newLogins = {title: `New login${r.created.length===1?"":"s"}`, list: r.created, problems: r.problems};
+      if (r.reset) S.newLogins = {title: `New password${r.reset.length===1?"":"s"}`, list: r.reset, problems: []};
+      await load(true);
+    } catch(e){ S.msg = {text: e.message, bad: true}; }
+    renderManage(currentClass());
+    $("#tmsg")?.scrollIntoView({block: "nearest"});
+  }
+  const chosen = () => [...S.sel];
+  const plural = (n, w) => `${n} ${w}${n===1?"":"s"}`;
+
+  document.querySelectorAll("[data-pick]").forEach(a=>a.onclick = e=>{ e.preventDefault(); store.set("ps-teacher-class", a.dataset.pick); renderManage(a.dataset.pick); });
+  $("#tnewclass").onsubmit = e=>{ e.preventDefault(); const n = e.target.n.value.trim(); if (!n) return;
+    if (n.toLowerCase()===NO_CLASS.toLowerCase()) return say(`"${NO_CLASS}" is used for students without a class. Choose another name.`, true);
+    run("createClass", {name: n}, ()=>`Class ${n} added.`); };
+  document.querySelectorAll("[data-rename-class]").forEach(b=>b.onclick = ()=>{ const from = b.dataset.renameClass, to = (prompt(`New name for class ${from}:`, from) || "").trim();
+    if (!to || to===from) return; if (to.toLowerCase()===NO_CLASS.toLowerCase()) return say(`"${NO_CLASS}" is used for students without a class.`, true);
+    run("renameClass", {name: from, newName: to}, ()=>{ if (store.get("ps-teacher-class", null)===from) store.set("ps-teacher-class", to); return `Class ${from} is now ${to}.`; }); });
+  document.querySelectorAll("[data-delete-class]").forEach(b=>b.onclick = ()=>{ const c = b.dataset.deleteClass, n = count(c);
+    if (!confirm(`Delete class ${c}?${n ? `\n\nIts ${plural(n, "student")} will move to ${NO_CLASS}. Their logins and work are kept.` : ""}`)) return;
+    run("deleteClass", {name: c}, r=>{ if (store.get("ps-teacher-class", null)===c) store.set("ps-teacher-class", "*"); return `Class ${c} deleted${r.moved ? `; ${plural(r.moved, "student")} moved to ${NO_CLASS}` : ""}.`; }); });
+
+  const syncSel = () => { const c = $("#tselcount"); if (c) c.textContent = `${S.sel.size} selected`; const all = $("#tselall"); if (all) all.checked = S.sel.size>0 && S.sel.size===people.length; };
+  document.querySelectorAll("[data-sel]").forEach(cb=>cb.onchange = ()=>{ cb.checked ? S.sel.add(cb.dataset.sel) : S.sel.delete(cb.dataset.sel); syncSel(); });
+  const all = $("#tselall"); if (all) all.onchange = ()=>{ people.forEach(s=>all.checked ? S.sel.add(s.username) : S.sel.delete(s.username)); document.querySelectorAll("[data-sel]").forEach(cb=>cb.checked = all.checked); syncSel(); };
+  const needSel = () => { if (!S.sel.size){ say("Tick at least one student first.", true); return false; } return true; };
+  const mv = $("#tmove"); if (mv) mv.onclick = ()=>{ if (!needSel()) return; const to = $("#tmoveto").value || null;
+    run("moveStudents", {usernames: chosen(), cls: to}, r=>`${plural(r.moved, "student")} moved to ${to || NO_CLASS}.`); };
+  const rs = $("#tresetsel"); if (rs) rs.onclick = ()=>{ if (!needSel()) return;
+    if (!confirm(`Give ${plural(S.sel.size, "student")} new passwords? Their old passwords will stop working.`)) return;
+    run("resetPasswords", {usernames: chosen()}, r=>`New passwords for ${plural(r.reset.length, "student")}. Hand them out from the list below.`); };
+  const as = $("#tarchsel"); if (as) as.onclick = ()=>{ if (!needSel()) return;
+    if (!confirm(`Archive ${plural(S.sel.size, "student")}? They'll be signed out and can't sign in until restored. Their work is kept.`)) return;
+    run("archiveStudents", {usernames: chosen()}, r=>`${plural(r.archived, "student")} archived.`); };
+  document.querySelectorAll("[data-reset]").forEach(b=>b.onclick = ()=>{ const u = b.dataset.reset;
+    if (!confirm(`Give ${u} a new password? The old one will stop working.`)) return;
+    run("resetPasswords", {usernames: [u]}, ()=>`New password for ${u}. It's shown below.`); });
+  document.querySelectorAll("[data-rename]").forEach(b=>b.onclick = ()=>{ const u = b.dataset.rename, name = (prompt(`New display name for ${u}:`, b.dataset.name) || "").trim();
+    if (!name || name===b.dataset.name) return; run("renameStudent", {username: u, name}, ()=>`${u} is now shown as ${name}.`); });
+  document.querySelectorAll("[data-archive]").forEach(b=>b.onclick = ()=>{ const u = b.dataset.archive;
+    if (!confirm(`Archive ${b.dataset.name} (${u})? They'll be signed out and can't sign in until restored. Their work is kept.`)) return;
+    run("archiveStudents", {usernames: [u]}, ()=>`${b.dataset.name} archived.`); });
+  document.querySelectorAll("[data-restore]").forEach(b=>b.onclick = ()=>run("restoreStudents", {usernames: [b.dataset.restore]}, ()=>`${b.dataset.restore} restored and can sign in again with their old password.`));
+  document.querySelectorAll("[data-delete]").forEach(b=>b.onclick = ()=>{ const u = b.dataset.delete;
+    const typed = prompt(`Delete ${b.dataset.name} (${u}) permanently?\n\nThis removes the login, all their work and history. It can't be undone.\n\nType the username to confirm:`);
+    if (typed===null) return; if (typed.trim().toLowerCase()!==u) return say("The username didn't match, so nothing was deleted.", true);
+    run("deleteStudents", {usernames: [u]}, ()=>`${u} deleted permanently.`); });
+
+  $("#tadd").onclick = ()=>{
+    const lines = $("#taddnames").value.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+    if (!lines.length) return say("Type at least one name.", true);
+    if (lines.length > 40) return say(`That's ${lines.length} names. Add up to 40 at a time.`, true);
+    const list = lines.map(l=>{ const i = l.lastIndexOf(","); return i>0 ? {name: l.slice(0,i).trim(), username: l.slice(i+1).trim()} : {name: l}; });
+    const to = $("#taddcls").value || null;
+    run("addStudents", {cls: to, students: list}, r=>`${plural(r.created.length, "login")} created${r.problems.length ? `; ${r.problems.length} not created (see below)` : ""}.`);
+  };
+  if (S.newLogins){
+    const done = $("#tdone"); if (done) done.onclick = ()=>{ if (S.newLogins.list.length && !confirm("Hide these passwords? They can't be shown again.")) return; S.newLogins = null; renderManage(cls); };
+    const pr = $("#tprint"); if (pr) pr.onclick = ()=>window.print();
+    const lc = $("#tlogcsv"); if (lc) lc.onclick = ()=>download(`programming-skills-logins-${fileDate()}.csv`,
+      [["Name","Class","Username","Password","Website"], ...S.newLogins.list.map(x=>[x.name, x.cls||"", x.username, x.password, SITE_URL])]);
+  }
+}
+
 /* ---------- entry ---------- */
 window.renderTeacher = async function(){
   const parts = location.hash.slice(1).split("/");
@@ -605,6 +774,7 @@ window.renderTeacher = async function(){
   if (parts[1]==="student" && parts[2]) renderStudent(parts[2]);
   else if (parts[1]==="questions") renderQuestions(cls);
   else if (parts[1]==="history") renderHistory(cls);
+  else if (parts[1]==="manage") renderManage(cls);
   else renderClass(cls);
 };
 })();

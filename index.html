@@ -1191,7 +1191,7 @@ def check(src, tests_json):
 
 </script>
 <script>
-const TEACHER_JS = "teacher.js?v=8af1b35744";
+const TEACHER_JS = "teacher.js?v=63b2e52257";
 /* ============================================================
    CONTENT — the skill map and the two pilot skills.
    Every item carries its 0984 spec reference.
@@ -8891,6 +8891,7 @@ const CLOUD = (()=>{
       try { r = await auth("token?grant_type=password", {email: `${u}@${CLOUD_DOMAIN}`, password: p}); }
       catch(e){ return fail("Can't reach the server. Check your internet connection and try again."); }
       if (!r.ok || !r.data || !r.data.user) return fail(r.status===429 ? "Too many attempts. Wait a minute, then try again."
+        : r.data && r.data.error_code==="user_banned" ? "This login has been switched off. Ask your teacher."
         : r.status===400 ? "That username and password don't match. Check them and try again." : "Sign-in isn't working right now. Try again soon, or tell your teacher.");
       session = null;
       adopt(r.data, {username: u, name: "", remember: form.r.checked});
@@ -8934,6 +8935,18 @@ const CLOUD = (()=>{
   }
   // Read-only queries for the teacher dashboard (GET only; database rules limit them to teacher logins).
   const teacherGet = path => isTeacher() ? rest(path) : Promise.reject(new Error("not a teacher"));
+  // Class and student management: the teacher-admin Edge Function does the work with the server-only key.
+  async function teacherAdmin(action, body={}, retried=false){
+    if (!session || !isTeacher()) throw new Error("Only teacher logins can manage classes and students.");
+    if (Date.now() > session.expires_at - 60000 && !(await refresh())) throw new Error("You've been signed out. Sign in again.");
+    let r;
+    try { r = await fetch(`${CLOUD_URL}/functions/v1/teacher-admin`, {method: "POST", headers: {apikey: CLOUD_KEY, Authorization: "Bearer " + session.access_token, "Content-Type": "application/json"}, body: JSON.stringify({...body, action})}); }
+    catch(e){ throw new Error("Can't reach the server. Check your internet connection and try again."); }
+    if (r.status===401 && !retried){ if (await refresh(true)) return teacherAdmin(action, body, true); throw new Error("You've been signed out. Sign in again."); }
+    let d = null; try { d = await r.json(); } catch(e){}
+    if (!r.ok) throw new Error(d && d.error ? d.error : r.status===404 ? "Student management isn't switched on yet: the teacher-admin function hasn't been deployed." : `That didn't work (server error ${r.status}). Try again.`);
+    return d;
+  }
 
   function accountDialog(){
     const {m} = dialog(`
@@ -8990,7 +9003,7 @@ const CLOUD = (()=>{
     run();
   }
 
-  return {storeKey, queue, start, openAccount, renderSignIn, isTeacher, teacherGet, uid: () => session ? session.uid : null, status: () => status, signedIn: () => !!session, who, username: () => session ? session.username : ""};
+  return {storeKey, queue, start, openAccount, renderSignIn, isTeacher, teacherGet, teacherAdmin, uid: () => session ? session.uid : null, status: () => status, signedIn: () => !!session, who, username: () => session ? session.username : ""};
 })();
 
 /* ============================================================
