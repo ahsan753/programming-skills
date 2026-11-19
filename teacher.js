@@ -4,7 +4,8 @@
    lets only teacher logins do this) and works out the numbers with the SAME
    functions the student site uses (xpTotal, skillPct, stageDone…), so a
    student's figures always match what they see.
-   Routes: #teacher · #teacher/student/<id> · #teacher/questions
+   Routes: #teacher · #teacher/student/<id> · #teacher/questions · #teacher/history
+   History (Phase 2) comes from progress_daily, which the database fills itself (002_history.sql).
    ============================================================ */
 (()=>{
 const CSS = `
@@ -65,6 +66,23 @@ table.tlist{border-collapse:collapse;width:100%;font-size:.9rem;margin:6px 0 12p
 .tcode summary{cursor:pointer;font-weight:800;color:var(--violet)}
 .tsub{font-size:1.05rem;margin:12px 0 2px}
 .tempty{color:var(--ink-3);font-style:italic}
+.tact td.wk{min-width:58px;font-weight:800;background:color-mix(in srgb,var(--violet) calc(var(--d,0)*8%),var(--paper))}
+.tact td.wk.zero{color:var(--ink-3);font-weight:600}
+.tact tfoot td{font-weight:900;background:var(--wash);position:sticky;bottom:0}
+.tchartwrap{overflow-x:auto;max-width:780px}
+.tchart{width:100%;min-width:520px;height:auto;display:block;overflow:visible}
+.tchart text{fill:var(--ink-2);font-size:12px;font-family:inherit;font-weight:700}
+.tchart .grid{stroke:var(--rule);stroke-width:1}
+.tchart .line{fill:none;stroke:var(--violet);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.tchart .pt{fill:var(--violet);stroke:var(--paper);stroke-width:2;pointer-events:none}
+.tchart .hit{fill:transparent}
+.tchart .hit:hover{fill:color-mix(in srgb,var(--violet) 18%,transparent)}
+.tstrip{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 4px}
+.tstrip .wkg{display:flex;gap:3px}
+.tstrip i{width:14px;height:14px;border-radius:4px;background:var(--wash);border:1px solid var(--rule)}
+.tstrip i.on{background:var(--violet);border-color:var(--violet)}
+.tstrip i.base{background:var(--violet-w);border-color:var(--violet-w)}
+.tdone td.by{color:var(--ink-2);font-style:italic}
 `;
 if (!document.getElementById("teachercss")){ const st=document.createElement("style"); st.id="teachercss"; st.textContent=CSS; document.head.appendChild(st); }
 
@@ -85,8 +103,41 @@ function flagSettings(){
 }
 
 /* ---------- data ---------- */
-const S = {roster:null, loadedAt:0, loading:null, error:null, sort:store.get("ps-teacher-sort",{key:"name",dir:1})};
+const S = {roster:null, loadedAt:0, loading:null, error:null, sort:store.get("ps-teacher-sort",{key:"name",dir:1}),
+           act:null, histErr:null, weekly:null, tl:new Map()};
 const DAY = 864e5;
+
+/* ---------- history (Phase 2: progress_daily, written by the database on every save) ---------- */
+// Days are school days in Qatar time (UTC+3), the same as the database uses. Weeks are rolling 7-day
+// blocks ending today, so "this week" is always the last 7 days.
+const TZ = "Asia/Qatar", WEEKS = 8;
+const ymd = d => d.toLocaleDateString("en-CA", {timeZone: TZ});
+const addDays = (s, n) => { const d = new Date(s + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0,10); };
+const dayNum = s => Date.parse(s + "T00:00:00Z") / DAY;
+const shortDate = s => new Date(s + "T00:00:00Z").toLocaleDateString("en-GB", {day:"numeric", month:"short", timeZone:"UTC"});
+const today = () => ymd(new Date());
+const histFrom = () => addDays(today(), -7*WEEKS + 1);
+const weekStarts = from => Array.from({length: WEEKS}, (_, k) => addDays(from, 7*k));
+const weekLabel = w => { const end = addDays(w, 6); return `${shortDate(w)} – ${shortDate(end > today() ? today() : end)}`; };
+const histMessage = e => /http 404/.test(e && e.message || "") ? "History isn't switched on yet. Run source/supabase/002_history.sql in the Supabase SQL editor."
+  : "Couldn't load the history. Try Refresh.";
+// Every page of a REST result (the API returns at most 1000 rows per request).
+async function getAll(path){
+  const out = [];
+  for (let off = 0; ; off += 1000){
+    const r = await CLOUD.teacherGet(`${path}${path.includes("?") ? "&" : "?"}limit=1000&offset=${off}`) || [];
+    out.push(...r); if (r.length < 1000) return out;
+  }
+}
+async function loadActivity(){
+  const from = histFrom(), rows = await getAll(`rpc/history_activity?p_from=${from}&order=user_id,week`);
+  const act = new Map();
+  rows.forEach(r=>{ if (!act.has(r.user_id)) act.set(r.user_id, new Map()); act.get(r.user_id).set(r.week, {days:r.days, saves:r.saves}); });
+  return {from, map: act};
+}
+const actFor = (stu, w) => S.act && S.act.map.get(stu.id)?.get(w) || {days:0, saves:0};
+const lastWeek = () => S.act ? weekStarts(S.act.from)[WEEKS-1] : null;
+
 async function load(force){
   if (!force && S.roster && Date.now()-S.loadedAt < 120000) return;
   if (S.loading) return S.loading;
@@ -94,8 +145,10 @@ async function load(force){
     try {
       const [people, rows] = await Promise.all([
         CLOUD.teacherGet("students?select=id,username,display_name,class_name,is_teacher&order=display_name.asc"),
-        CLOUD.teacherGet("progress?select=user_id,data,updated_at")
+        CLOUD.teacherGet("progress?select=user_id,data,updated_at"),
+        loadActivity().then(a=>{ S.act = a; S.histErr = null; }, e=>{ S.act = null; S.histErr = histMessage(e); })
       ]);
+      S.weekly = null; S.tl.clear();
       const byId = new Map((rows||[]).map(r=>[r.user_id, r]));
       S.roster = (people||[]).filter(p=>!p.is_teacher && !/^test\./.test(p.username)).map(p=>{
         const row = byId.get(p.id), prog = cleanProgress(row ? row.data : {});
@@ -172,7 +225,7 @@ function header(tab, cls){
   const opts = classes().map(c=>`<option value="${esc(c)}" ${c===cls?"selected":""}>${esc(c)}</option>`).join("");
   return `<div class="ttop">
     <h1>📊 Teacher dashboard</h1>
-    <nav class="ttabs" aria-label="Dashboard views"><a href="#teacher" class="${tab==="class"?"on":""}">Class overview</a><a href="#teacher/questions" class="${tab==="questions"?"on":""}">Question analysis</a></nav>
+    <nav class="ttabs" aria-label="Dashboard views"><a href="#teacher" class="${tab==="class"?"on":""}">Class overview</a><a href="#teacher/questions" class="${tab==="questions"?"on":""}">Question analysis</a><a href="#teacher/history" class="${tab==="history"?"on":""}">History</a></nav>
     <span class="spacer"></span>
     <div class="tctl">
       <label>Class <select id="tclass"><option value="*" ${cls==="*"?"selected":""}>All classes</option>${opts}</select></label>
@@ -211,8 +264,10 @@ function renderClass(cls){
   const avg = signed.length ? Math.round(signed.reduce((n,s)=>n+s.st.overall,0)/signed.length) : 0;
   const help = list.filter(s=>s.flags.length);
 
-  const key = S.sort.key, dir = S.sort.dir;
+  const key = S.sort.key, dir = S.sort.dir, lw = lastWeek();
+  const wk = s => lw ? actFor(s, lw) : null;
   const val = s => key==="name" ? s.name.toLowerCase() : key==="active" ? (s.updated ? -s.updated.getTime() : Infinity)
+    : key==="week" ? (lw ? wk(s).days*1e5 + wk(s).saves : 0)
     : key==="xp" ? s.st.xp : key==="done" ? s.st.done : key==="overall" ? s.st.overall : key==="flags" ? s.flags.length : s.st.skills[key] ? s.st.skills[key].pct : 0;
   const rows = [...list].sort((a,b)=>{ const x=val(a), y=val(b); return (x<y?-1:x>y?1:0)*dir || a.name.localeCompare(b.name); });
   const th = (k, label, title="") => `<th scope="col" class="${k==="name"?"tname":""}${SKILLS[k]?" sk":""}" ${key===k?`aria-sort="${dir>0?"ascending":"descending"}"`:""}><button type="button" data-sort="${k}" title="${esc(title||label)}">${label}${key===k?(dir>0?" ▲":" ▼"):""}</button></th>`;
@@ -228,6 +283,7 @@ function renderClass(cls){
     return `<tr class="${s.hasRow?"":"never"}">
       <td class="tname"><a href="#teacher/student/${s.id}">${esc(s.name)}</a>${cls==="*"?` <span class="muted">${esc(s.cls)}</span>`:""}</td>
       <td class="${d!==null && d>=F.inactiveDays || !s.hasRow ? "late" : ""}" title="${esc(stamp(s.updated))}">${when(s.updated)}</td>
+      <td title="${lw ? esc(`${wk(s).days} of the last 7 days active, ${wk(s).saves} saves`) : "History not available"}">${lw ? `${wk(s).days}/7` : "–"}</td>
       <td>${s.hasRow ? `${s.st.level.n} · ${esc(s.st.level.title)}` : "–"}</td><td>${s.hasRow ? s.st.xp : "–"}</td>
       <td>${s.hasRow ? `${s.st.done}/${live.length}` : "–"}</td><td>${s.hasRow ? s.st.overall+"%" : "–"}</td>
       <td>${s.flags.length ? `<span class="tchip k-${s.flags[0].kind}">${s.flags.length}</span>` : ""}</td>
@@ -256,7 +312,7 @@ function renderClass(cls){
     </section>
     <section class="panel"><div class="ttop" style="margin:0 0 10px"><h2 style="margin:0">Progress by skill</h2><span class="spacer"></span><button class="btn" type="button" id="tcsv">⬇ Download class grid (Excel/CSV)</button></div>
       ${list.length ? `<div class="tgridwrap"><table class="tgrid"><caption class="sr-only">Progress for each student and skill</caption>
-        <thead><tr>${th("name","Student")}${th("active","Last active")}<th scope="col">Level</th>${th("xp","XP")}${th("done","Skills done","Checkpoint finished or tested out")}${th("overall","Overall")}${th("flags","🚩","Number of flags")}
+        <thead><tr>${th("name","Student")}${th("active","Last active")}${th("week","Last 7 days","Days active in the last 7 days")}<th scope="col">Level</th>${th("xp","XP")}${th("done","Skills done","Checkpoint finished or tested out")}${th("overall","Overall")}${th("flags","🚩","Number of flags")}
         ${live.map(id=>th(id, String(SKILLS[id].n), `Skill ${SKILLS[id].n}: ${SKILLS[id].title}`)).join("")}</tr></thead>
         <tbody>${body}</tbody></table></div>
       <div class="tlegend"><span><i style="background:var(--paper)"></i>Not started</span><span><i style="background:color-mix(in srgb,var(--amber) 25%,var(--paper))"></i>In progress (%)</span><span><i style="background:var(--green-w)"></i>✓ Checkpoint done</span><span><i style="background:var(--violet-w)"></i>⚡ Tested out</span><span>Hover a cell for details.</span></div>`
@@ -272,10 +328,11 @@ function renderClass(cls){
   document.querySelectorAll("[data-flag]").forEach(inp=>inp.onchange=()=>{ const f=flagSettings(); f[inp.dataset.flag]=Number(inp.value); store.set("ps-teacher-flags", f); redraw(`[data-flag="${inp.dataset.flag}"]`); });
   $("#tflagreset").onclick = ()=>{ store.set("ps-teacher-flags", {}); redraw("#tflagreset"); };
   const csv = $("#tcsv"); if (csv) csv.onclick = ()=>{
-    const head = ["Name","Username","Class","Last active","Days since active","Level","XP","Skills done","Overall %","Flags"];
+    const head = ["Name","Username","Class","Last active","Days since active","Days active (last 7 days)","Saves (last 7 days)","Level","XP","Skills done","Overall %","Flags"];
     live.forEach(id=>{ const n=SKILLS[id].n; head.push(`S${n} %`, `S${n} Apply`, `S${n} Checkpoint`); });
     const out = [head, ...rows.map(s=>{
       const r = [s.name, s.username, s.cls, s.updated ? s.updated.toISOString().slice(0,10) : "Never", s.hasRow ? daysSince(s.updated) : "",
+                 lw ? wk(s).days : "", lw ? wk(s).saves : "",
                  s.hasRow ? `${s.st.level.n} ${s.st.level.title}` : "", s.hasRow ? s.st.xp : "", s.hasRow ? s.st.done : "", s.hasRow ? s.st.overall : "", s.flags.map(f=>f.text).join("; ")];
       live.forEach(id=>{ const k=s.st.skills[id]; r.push(k.pct, `${k.ap.got}/${k.ap.of}`, k.ck.of ? `${k.ck.got}/${k.ck.of}` : ""); });
       return r;
@@ -339,9 +396,139 @@ function renderStudent(id){
       ${flags.length ? `<p style="margin:6px 0 0">${flags.map(f=>`<span class="tchip k-${f.kind}">${esc(f.text)}</span>`).join(" ")}</p>` : ""}
       ${badges||fast ? `<div class="tbadges">${badges}${fast}</div>` : ""}
     </section>
+    ${stu.hasRow ? `<section class="panel" id="ttimeline" aria-live="polite"><h2>📈 Timeline</h2><p class="muted">Loading history…</p></section>` : ""}
     ${stu.hasRow ? skills : ""}
   </div>`;
   wireHeader();
+  if (stu.hasRow) timeline(stu).then(html=>{ const box = $("#ttimeline"); if (box && location.hash===`#teacher/student/${id}`) box.innerHTML = html; });
+}
+
+/* ---------- history: chart, student timeline, class history ---------- */
+// One-series line chart (0–100%) with dates on a true time axis. Each point has a hover/focus tooltip.
+function lineChart(pts, label){
+  if (!pts.length) return `<p class="tempty">No history yet.</p>`;
+  const W = 760, H = 240, L = 46, R = 18, T = 14, B = 36, iw = W-L-R, ih = H-T-B;
+  const x0 = dayNum(pts[0].x), x1 = dayNum(pts[pts.length-1].x);
+  const X = s => L + (x1===x0 ? iw/2 : iw*(dayNum(s)-x0)/(x1-x0)), Y = v => T + ih - ih*Math.max(0, Math.min(v, 100))/100;
+  const grid = [0,25,50,75,100].map(v=>`<line class="grid" x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}"/><text x="${L-8}" y="${Y(v)+4}" text-anchor="end">${v}%</text>`).join("");
+  const n = pts.length, idx = [...new Set(n<=3 ? pts.map((_,i)=>i) : [0, Math.round((n-1)/2), n-1])];
+  const xl = idx.map(i=>`<text x="${X(pts[i].x).toFixed(1)}" y="${H-12}" text-anchor="${n===1?"middle":i===0?"start":i===n-1?"end":"middle"}">${esc(shortDate(pts[i].x))}</text>`).join("");
+  const line = n>1 ? `<path class="line" d="${pts.map((p,i)=>`${i?"L":"M"}${X(p.x).toFixed(1)},${Y(p.y).toFixed(1)}`).join("")}"/>` : "";
+  const dots = pts.map(p=>{ const cx = X(p.x).toFixed(1), cy = Y(p.y).toFixed(1);
+    return `<circle class="hit" cx="${cx}" cy="${cy}" r="11" tabindex="0" role="img" aria-label="${esc(p.tip)}"><title>${esc(p.tip)}</title></circle>${n<=60?`<circle class="pt" cx="${cx}" cy="${cy}" r="4"/>`:""}`; }).join("");
+  return `<div class="tchartwrap"><svg class="tchart" viewBox="0 0 ${W} ${H}" role="group" aria-label="${esc(label)}">${grid}${xl}${line}${dots}</svg></div>`;
+}
+
+async function timeline(stu){
+  let cached = S.tl.get(stu.id);
+  if (!cached || Date.now()-cached.at > 120000){
+    try {
+      const rows = await getAll(`progress_daily?select=day,saves,data&user_id=eq.${encodeURIComponent(stu.id)}&order=day.asc`);
+      cached = {at: Date.now(), snaps: rows.map(r=>({day: r.day, saves: r.saves, st: stats(cleanProgress(r.data))}))};
+      S.tl.set(stu.id, cached);
+    } catch(e){ return `<h2>📈 Timeline</h2><p class="tempty">${esc(histMessage(e))}</p>`; }
+  }
+  const snaps = cached.snaps;
+  if (!snaps.length) return `<h2>📈 Timeline</h2><p class="tempty">No history yet. It starts with this student's next save.</p>`;
+  const base = snaps[0].saves===0 ? snaps[0].day : null;    // starting point copied at launch: earlier work has no exact date
+
+  // Activity: the last 8 weeks, one square per day, newest on the right.
+  const from = histFrom(), byDay = new Map(snaps.map(s=>[s.day, s]));
+  const strip = weekStarts(from).map(w=>`<span class="wkg">${Array.from({length:7}, (_, k)=>{
+      const d = addDays(w, k); if (d > today()) return "";
+      const s = byDay.get(d), on = s && s.saves>0, isBase = s && s.day===base;
+      return `<i class="${on?"on":isBase?"base":""}" title="${esc(`${shortDate(d)}: ${on ? `${s.saves} save${s.saves===1?"":"s"}` : isBase ? "starting point (work before history began)" : "no activity"}`)}"></i>`;
+    }).join("")}</span>`).join("");
+  const recent = snaps.filter(s=>s.day>=from && s.saves>0);
+
+  // "Completed on": the first day each stage appears done.
+  const firstDay = test => { const s = snaps.find(test); return s ? s.day : null; };
+  const cellFor = d => d ? (d===base ? `<td class="by" title="Already done when history began">by ${esc(shortDate(d))}</td>` : `<td>${esc(shortDate(d))}</td>`) : `<td class="tempty">–</td>`;
+  const doneRows = liveSkills().map(sid=>{
+    const dates = STAGES.map(x=>firstDay(s=>s.st.skills[sid].stages[x.id]));
+    const tested = firstDay(s=>s.st.skills[sid].state==="tested");
+    if (!dates.some(Boolean) && !tested) return "";
+    const ck = dates[3] ? cellFor(dates[3]) : tested ? (tested===base ? `<td class="by">⚡ tested out by ${esc(shortDate(tested))}</td>` : `<td>⚡ tested out ${esc(shortDate(tested))}</td>`) : cellFor(null);
+    return `<tr><td>Skill ${SKILLS[sid].n} · ${esc(SKILLS[sid].title)}</td>${dates.slice(0,3).map(cellFor).join("")}${ck}</tr>`;
+  }).join("");
+
+  const pts = snaps.map(s=>({x: s.day, y: s.st.overall, tip: `${shortDate(s.day)}: ${s.st.overall}% overall, ${s.st.xp} XP, ${s.st.done} skill${s.st.done===1?"":"s"} done${s.saves ? `, ${s.saves} save${s.saves===1?"":"s"}` : " (starting point)"}`}));
+  return `<h2>📈 Timeline</h2>
+    <h3 class="tsub">Activity, last ${WEEKS} weeks</h3>
+    <div class="tstrip" aria-label="Days active in the last ${WEEKS} weeks">${strip}</div>
+    <p class="muted" style="font-size:.85rem">${recent.length} day${recent.length===1?"":"s"} active, ${recent.reduce((n,s)=>n+s.saves,0)} saves. Each block is 7 days, newest on the right; hover a square for the date.</p>
+    <h3 class="tsub">Overall progress</h3>
+    ${lineChart(pts, `Overall progress of ${stu.name} over time`)}
+    <h3 class="tsub">Completed on</h3>
+    ${doneRows ? `<div class="tgridwrap" style="max-height:none"><table class="tlist tdone" style="margin:0"><thead><tr><th>Skill</th><th>Learn</th><th>Practise</th><th>Apply</th><th>Checkpoint</th></tr></thead><tbody>${doneRows}</tbody></table></div>` : `<p class="tempty">Nothing finished yet.</p>`}
+    ${base ? `<p class="muted" style="font-size:.85rem">History began on ${esc(shortDate(base))}. “by ${esc(shortDate(base))}” means it was already done then, so the exact day isn't known.</p>` : ""}`;
+}
+
+async function loadWeekly(){
+  if (S.weekly && Date.now()-S.weekly.at < 120000) return S.weekly;
+  const from = histFrom(), rows = await getAll(`rpc/history_weekly?p_from=${from}&order=user_id,week`);
+  const by = new Map();
+  rows.forEach(r=>{ if (!by.has(r.user_id)) by.set(r.user_id, new Map()); by.get(r.user_id).set(r.week, stats(cleanProgress(r.data)).overall); });
+  return S.weekly = {at: Date.now(), from, by};
+}
+
+async function renderHistory(cls){
+  $("#app").innerHTML = `<div class="tdash">${header("history", cls)}<section class="panel"><p class="muted">Loading history…</p></section></div>`;
+  wireHeader();
+  let wkly = null, err = S.histErr;
+  if (!err) { try { wkly = await loadWeekly(); } catch(e){ err = histMessage(e); } }
+  if (!location.hash.startsWith("#teacher/history")) return;
+  if (err || !S.act){
+    $("#app").innerHTML = `<div class="tdash">${header("history", cls)}<section class="panel"><h2>📈 History</h2><p class="errbox">${esc(err || "No history.")}</p></section></div>`;
+    wireHeader(); return;
+  }
+  const list = inClass(cls), weeks = weekStarts(S.act.from), signed = list.filter(s=>s.hasRow);
+
+  const totals = weeks.map(w=>list.reduce((a,s)=>{ const v = actFor(s, w); a.days += v.days; a.saves += v.saves; if (v.days) a.active++; return a; }, {days:0, saves:0, active:0}));
+  // Class progress: each student's latest value by the end of each week (carried forward), averaged over
+  // the same students every week (everyone in the class who has signed in), counting "not started yet" as 0%,
+  // so the line only moves when work is done, not when someone new joins.
+  const series = [], startKey = addDays(wkly.from, -7), n = signed.length;
+  const at = (s, upto) => { const m = wkly.by.get(s.id); if (!m) return 0; let v = m.has(startKey) ? m.get(startKey) : 0; for (const w of weeks){ if (w > upto) break; if (m.has(w)) v = m.get(w); } return v; };
+  const avgAt = upto => n ? Math.round(signed.reduce((a,s)=>a+at(s, upto), 0)/n) : 0;
+  if (n && signed.some(s=>wkly.by.get(s.id)?.has(startKey))) series.push({x: addDays(wkly.from, -1), y: avgAt(startKey), week: null});
+  if (n) weeks.forEach(w=>series.push({x: addDays(w, 6) > today() ? today() : addDays(w, 6), y: avgAt(w), week: w}));
+  series.forEach(p=>p.tip = `${p.week ? `Week ${weekLabel(p.week)}` : `Before ${shortDate(wkly.from)}`}: class average ${p.y}% overall`);
+
+  const now = totals[WEEKS-1], prev = totals[WEEKS-2];
+  const rows = [...list].sort((a,b)=>a.name.localeCompare(b.name)).map(s=>`<tr class="${s.hasRow?"":"never"}"><td class="tname"><a href="#teacher/student/${s.id}">${esc(s.name)}</a>${cls==="*"?` <span class="muted">${esc(s.cls)}</span>`:""}</td>
+      ${weeks.map(w=>{ const v = actFor(s, w); return `<td class="wk ${v.days?"":"zero"}" style="--d:${v.days}" title="${esc(`${s.name}, ${weekLabel(w)}: ${v.days} day${v.days===1?"":"s"} active, ${v.saves} saves`)}">${v.days}</td>`; }).join("")}</tr>`).join("");
+
+  $("#app").innerHTML = `<div class="tdash">${header("history", cls)}
+    <div class="tcards">
+      <div class="tcard"><b>${now.active}</b><small>Active in the last 7 days (week before: ${prev.active})</small></div>
+      <div class="tcard"><b>${now.days}</b><small>Student-days of work, last 7 days</small></div>
+      <div class="tcard"><b>${now.saves}</b><small>Saves, last 7 days</small></div>
+    </div>
+    <section class="panel"><h2>📈 Class progress over time</h2>
+      <p class="muted">The class's average overall progress at the end of each week, across the ${n} student${n===1?"":"s"} who have signed in (anyone who hadn't started yet counts as 0%). Hover a point for the figures.</p>
+      ${lineChart(series, `Average overall progress over time${cls==="*"?"":` for ${cls}`}`)}
+      <details style="margin-top:8px"><summary class="muted" style="cursor:pointer;font-weight:800">Show as a table</summary>
+        <table class="tlist"><thead><tr><th>Week</th><th class="num">Class average overall</th><th class="num">Students active</th></tr></thead>
+        <tbody>${series.map(p=>`<tr><td>${p.week ? esc(weekLabel(p.week)) : `Before ${esc(shortDate(wkly.from))}`}</td><td class="num">${p.y}%</td><td class="num">${p.week ? totals[weeks.indexOf(p.week)].active : "–"}</td></tr>`).join("")}</tbody></table>
+      </details>
+    </section>
+    <section class="panel"><div class="ttop" style="margin:0 0 10px"><h2 style="margin:0">🗓 Days active each week</h2><span class="spacer"></span><button class="btn" type="button" id="thcsv">⬇ Download activity (Excel/CSV)</button></div>
+      ${list.length ? `<div class="tgridwrap"><table class="tgrid tact"><caption class="sr-only">Days active per student in each of the last ${WEEKS} weeks</caption>
+        <thead><tr><th scope="col" class="tname">Student</th>${weeks.map(w=>`<th scope="col" title="${esc(weekLabel(w))}">${esc(shortDate(w))}</th>`).join("")}</tr></thead>
+        <tbody>${rows}</tbody>
+        <tfoot><tr><td class="tname">Students active</td>${totals.map(t=>`<td>${t.active}</td>`).join("")}</tr></tfoot></table></div>
+      <div class="tlegend"><span>Each column is 7 days, starting on the date shown; the last column is the last 7 days. Numbers are days with at least one save (0–7). Hover for saves.</span></div>`
+      : `<p class="tempty">No students in this class yet.</p>`}
+    </section>
+    <p class="muted" style="font-size:.85rem">History is recorded by the database each time a student's progress changes, so these dates and counts can be trusted. It began when Phase 2 was switched on; earlier work counts as a starting point.</p>
+  </div>`;
+  wireHeader();
+  const b = $("#thcsv"); if (b) b.onclick = ()=>{
+    const out = [["Name","Username","Class", ...weeks.flatMap(w=>[`${weekLabel(w)} days active`, `${weekLabel(w)} saves`])]];
+    [...list].sort((a,c)=>a.name.localeCompare(c.name)).forEach(s=>out.push([s.name, s.username, s.cls, ...weeks.flatMap(w=>{ const v = actFor(s, w); return [v.days, v.saves]; })]));
+    download(`programming-skills-activity-${fileCls(cls)}-${fileDate()}.csv`, out);
+  };
 }
 
 /* ---------- question analysis ---------- */
@@ -417,6 +604,7 @@ window.renderTeacher = async function(){
   const cls = currentClass();
   if (parts[1]==="student" && parts[2]) renderStudent(parts[2]);
   else if (parts[1]==="questions") renderQuestions(cls);
+  else if (parts[1]==="history") renderHistory(cls);
   else renderClass(cls);
 };
 })();
