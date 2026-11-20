@@ -44,6 +44,11 @@ table.tgrid{border-collapse:separate;border-spacing:0;font-size:.88rem;min-width
 .tgrid td.st-prog{background:color-mix(in srgb,var(--amber) calc(var(--p,0)*0.35%),var(--paper));}
 .tgrid td.st-done{background:var(--green-w);color:var(--green-d)}
 .tgrid td.st-tested{background:var(--violet-w);color:var(--violet-d)}
+.tgrid td.st-catch{background:var(--orange-w);color:var(--orange-t)}
+.tgrid td.pc{border-left:1px dashed var(--rule)}
+.tgrid td small{font-size:.72rem;font-weight:900}
+.tgrid th.tgrp{border-left:1px solid var(--rule);font-weight:900;padding-bottom:2px}
+.tgrid tr.tsub th{font-size:.8rem;padding-top:2px}
 .tgrid tr.never td{color:var(--ink-3)}
 .tgrid td.late{color:var(--red);font-weight:800}
 .tlegend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:.84rem;color:var(--ink-2);margin:8px 2px 0}
@@ -127,7 +132,7 @@ function flagSettings(){
 
 /* ---------- data ---------- */
 const S = {roster:null, loadedAt:0, loading:null, error:null, sort:store.get("ps-teacher-sort",{key:"name",dir:1}),
-           act:null, histErr:null, weekly:null, tl:new Map(),
+           act:null, histErr:null, weekly:null, tl:new Map(), snapOld:false, snapV:false,
            classes:null, archived:[], manageErr:null, sel:new Set(), newLogins:null, msg:null};
 const NO_CLASS = "No class", TEST_CLASS = "TEST";        // TEST holds the automated tests' logins: hidden here
 const DAY = 864e5;
@@ -146,6 +151,21 @@ const weekStarts = from => Array.from({length: WEEKS}, (_, k) => addDays(from, 7
 const weekLabel = w => { const end = addDays(w, 6); return `${shortDate(w)} – ${shortDate(end > today() ? today() : end)}`; };
 const histMessage = e => /http 404/.test(e && e.message || "") ? "History isn't switched on yet. Run source/supabase/002_history.sql in the Supabase SQL editor."
   : "Couldn't load the history. Try Refresh.";
+// Is 004_units.sql in place? Without it the database's history copy (002) drops _v and the unit objects (s1pc …),
+// so a snapshot of a new-format row arrives with question-id keys (practise.p1, check.c1) but no _v. Once any
+// loaded snapshot has _v, 004 is running and the note goes (older snapshots from before it are expected).
+function noteSnaps(list){
+  list.forEach(raw=>{
+    const d = object(raw);
+    if (Object.prototype.hasOwnProperty.call(d, "_v")){ S.snapV = true; return; }
+    if (Object.keys(d).some(k=>{
+      if (!/^s\d{1,3}$/.test(k)) return false;
+      const keys = ["practise","check"].flatMap(f=>Object.keys(object(object(d[k])[f])));
+      return keys.some(x=>/^[pc]\d+$/.test(x)) && !keys.some(x=>/^\d+$/.test(x));
+    })) S.snapOld = true;
+  });
+}
+const unitsNote = () => S.snapOld && !S.snapV ? `<p class="errbox" role="status" id="tno004">History isn't recording pseudocode units yet: run source/supabase/004_units.sql in Supabase.</p>` : "";
 // Every page of a REST result (the API returns at most 1000 rows per request).
 async function getAll(path){
   const out = [];
@@ -175,7 +195,7 @@ async function load(force){
         CLOUD.teacherGet("classes?select=name&order=name.asc").then(r=>{ S.classes = (r||[]).map(c=>c.name).filter(n=>n!==TEST_CLASS); S.manageErr = null; },
           e=>{ S.classes = null; S.manageErr = /http 404/.test(e.message) ? "Class and student management isn't switched on yet. Run source/supabase/003_manage.sql and deploy the teacher-admin function (see the README)." : "Couldn't load the class list. Try Refresh."; })
       ]);
-      S.weekly = null; S.tl.clear();
+      S.weekly = null; S.tl.clear(); S.snapOld = S.snapV = false;
       const byId = new Map((rows||[]).map(r=>[r.user_id, r]));
       const all = (people||[]).filter(p=>!p.is_teacher && !/^test\./.test(p.username)).map(p=>{
         const row = byId.get(p.id), prog = cleanProgress(row ? row.data : {});
@@ -195,26 +215,38 @@ async function load(force){
 
 // Run the student site's own progress functions against one student's saved progress.
 function withProg(prog, fn){ const keep = PROG; PROG = prog; try { return fn(); } finally { PROG = keep; } }
+// "Skills done" counts Python Skills 1, 2 … only when the skill AND its pseudocode unit are finished (or tested out).
+// Skill 0 is an introduction with no unit: it has its own cell but isn't counted, so an existing student who skipped
+// it (it shows "Optional · done" for them) and a new student who did it compare fairly.
+const countedSkills = () => liveSkills().filter(id=>!isUnit(id) && id!=="s0");
 function stats(prog){
   return withProg(prog, ()=>{
     const skills = {};
-    let pctSum = 0, done = 0;
+    let pctSum = 0;
     liveSkills().forEach(id=>{
       const s = SKILLS[id], p = P(id);
       const pct = skillPct(id), tested = testedOut(id), stages = {};
-      STAGES.forEach(x=>stages[x.id] = !!stageDone(id, x.id));
-      const started = p.learn || Object.values(p.att).some(n=>n>0) || Object.values(p.tries).some(n=>n>0) || Object.keys(p.check).length>0;
-      const ck = s.check.reduce((a,c,i)=>{ if (c.type!=="selfmark" && p.check[i]!==undefined){ a.got+=p.check[i]; a.of+=c.marks; } return a; }, {got:0, of:0});
+      stagesOf(id).forEach(x=>stages[x.id] = !!stageDone(id, x.id));   // Skill 0 has no Checkpoint stage
+      const fin = itemDone(id);   // the Checkpoint done; Skill 0 by its own rule (game.js)
+      const ck = s.check.reduce((a,c)=>{ if (c.type!=="selfmark" && p.check[c.id]!==undefined){ a.got+=p.check[c.id]; a.of+=c.marks; } return a; }, {got:0, of:0});
       const ap = s.apply.reduce((a,t)=>{ a.of+=t.marks; if (p.apply[t.id]) a.got+=p.apply[t.id].got; return a; }, {got:0, of:0});
-      const state = stages.check ? "done" : tested ? "tested" : started ? "prog" : "none";
-      if (stages.check || tested) done++;
+      const state = fin ? "done" : tested ? "tested" : hasStarted(id) ? "prog" : "none";   // hasStarted: game.js
+      // Replicate tasks at 'Nearly there' or better. A unit can count as done without them, because old Checkpoint
+      // answers moved into it (Ruling 11), so the teacher can see who still has to replicate.
+      const rep = isUnit(id) ? {got:s.apply.filter(a=>{ const r=p.apply[a.id]; return r && r.got/r.of>=0.6; }).length, of:s.apply.length} : null;
       pctSum += pct;
-      skills[id] = {pct, state, stages, ck, ap, practised:s.practise.filter((_,i)=>p.practise[i]).length};
+      skills[id] = {pct, state, stages, ck, ap, rep, catchUp:catchUp(id), practised:s.practise.filter(q=>p.practise[q.id]).length};
     });
+    const fin = id => skills[id].state==="done" || skills[id].state==="tested";
+    const done = countedSkills().filter(id=>fin(id) && (!unitOf(id) || fin(unitOf(id)))).length;
     const xp = xpTotal(), G = prog._game || {};
     return {xp, level:levelOf(xp), skills, done, overall:Math.round(pctSum/liveSkills().length), best:G.best||0, badges:G.badges||{}};
   });
 }
+// Short column labels for the CSV: "S0", "S1 Py", "S1 Pc".
+const colLabel = id => id==="s0" ? "S0" : `S${SKILLS[id].n} ${isUnit(id) ? "Pc" : "Py"}`;
+// A unit counted as done whose Replicate tasks aren't all at 'Nearly there': "R0/2".
+const repShort = k => k.rep && k.state==="done" && k.rep.got<k.rep.of ? `R${k.rep.got}/${k.rep.of}` : "";
 const daysSince = d => d ? Math.floor((Date.now()-d.getTime())/DAY) : null;
 function flagsFor(stu, median, F){
   const out = [], days = daysSince(stu.updated), href = `#teacher/student/${stu.id}`;
@@ -223,9 +255,10 @@ function flagsFor(stu, median, F){
   const stuck = [], apply = [], low = [];
   liveSkills().forEach(id=>{
     const s = SKILLS[id], p = stu.prog[id], k = stu.st.skills[id];
-    s.practise.forEach((q,i)=>{ if (!p.practise[i] && (p.att[i]||0)>=F.practiseTries) stuck.push(`Skill ${s.n} Practise Q${i+1} (${p.att[i]} tries)`); });
-    s.apply.forEach(a=>{ const r=p.apply[a.id], n=p.tries[a.id]||0; if (n>=F.applyChecks && !(r && r.got/r.of>=0.6)) apply.push(`Skill ${s.n} “${a.title}” ${r?`${r.got}/${r.of}`:"0"} after ${n} checks`); });
-    if (k.stages.check && k.ck.of && 100*k.ck.got/k.ck.of < F.checkPct) low.push(`Skill ${s.n} Checkpoint ${Math.round(100*k.ck.got/k.ck.of)}%`);
+    const name = skillName(id);   // "Skill 3" or "Skill 3 Pseudocode"
+    s.practise.forEach((q,i)=>{ if (!p.practise[q.id] && (p.att[q.id]||0)>=F.practiseTries) stuck.push(`${name} Practise Q${i+1} (${p.att[q.id]} tries)`); });
+    s.apply.forEach(a=>{ const r=p.apply[a.id], n=p.tries[a.id]||0; if (n>=F.applyChecks && !(r && r.got/r.of>=0.6)) apply.push(`${name} “${a.title}” ${r?`${r.got}/${r.of}`:"0"} after ${n} checks`); });
+    if (k.stages.check && k.ck.of && 100*k.ck.got/k.ck.of < F.checkPct) low.push(`${name} Checkpoint ${Math.round(100*k.ck.got/k.ck.of)}%`);
   });
   const more = (list, kind, label) => { if (list.length) out.push({kind, text: label + list.slice(0,2).join("; ") + (list.length>2?` (+${list.length-2} more)`:""), href}); };
   more(stuck, "stuck", "Stuck: "); more(apply, "apply", "Apply: "); more(low, "low", "Low: ");
@@ -299,13 +332,26 @@ function renderClass(cls){
     : key==="week" ? (lw ? wk(s).days*1e5 + wk(s).saves : 0)
     : key==="xp" ? s.st.xp : key==="done" ? s.st.done : key==="overall" ? s.st.overall : key==="flags" ? s.flags.length : s.st.skills[key] ? s.st.skills[key].pct : 0;
   const rows = [...list].sort((a,b)=>{ const x=val(a), y=val(b); return (x<y?-1:x>y?1:0)*dir || a.name.localeCompare(b.name); });
-  const th = (k, label, title="") => `<th scope="col" class="${k==="name"?"tname":""}${SKILLS[k]?" sk":""}" ${key===k?`aria-sort="${dir>0?"ascending":"descending"}"`:""}><button type="button" data-sort="${k}" title="${esc(title||label)}">${label}${key===k?(dir>0?" ▲":" ▼"):""}</button></th>`;
+  // span: {rows:2} for the columns beside the two-row skill headings; label may be a short "Py"/"Pc" with a full aria name.
+  const th = (k, label, title="", span={}, aria="") => `<th scope="col" class="${k==="name"?"tname":""}${SKILLS[k]?" sk":""}"${span.rows?` rowspan="${span.rows}"`:""} ${key===k?`aria-sort="${dir>0?"ascending":"descending"}"`:""}><button type="button" data-sort="${k}" title="${esc(title||label)}"${aria?` aria-label="${esc(aria)}"`:""}>${label}${key===k?(dir>0?" ▲":" ▼"):""}</button></th>`;
+  const two = {rows:2};
+  // Skill headings: "Skill N" over a Python and a Pseudocode column (Skill 0 has only Python, so one column).
+  const pyIds = live.filter(id=>!isUnit(id));
+  const groupHead = pyIds.map(id=>{ const sk = SKILLS[id];
+    if (id==="s0") return th(id, "0", `Skill 0: ${sk.title}`, two, `Skill 0: ${sk.title}`);
+    return `<th scope="colgroup" class="tgrp" colspan="${unitOf(id)?2:1}" title="${esc(`Skill ${sk.n}: ${sk.title}`)}">Skill ${sk.n}</th>`; }).join("");
+  const subHead = pyIds.filter(id=>id!=="s0").map(id=>{ const n = SKILLS[id].n, u = unitOf(id);
+    return th(id, "Py", `Skill ${n} in Python: ${SKILLS[id].title}`, {}, `Skill ${n} Python`) + (u ? th(u, "Pc", `Skill ${n} in pseudocode (Unit ${n})`, {}, `Skill ${n} Pseudocode`) : ""); }).join("");
 
   const cell = (s, id) => {
-    const k = s.st.skills[id], sk = SKILLS[id];
-    const tip = `Skill ${sk.n} ${sk.title}: ${k.pct}% · Learn ${k.stages.learn?"✓":"–"} · Practise ${k.practised}/${sk.practise.length} · Apply ${k.ap.got}/${k.ap.of} · Checkpoint ${k.ck.of?`${k.ck.got}/${k.ck.of}`:"–"}${k.state==="tested"?" · tested out":""}`;
-    const txt = k.state==="done" ? "✓" : k.state==="tested" ? "⚡" : k.state==="prog" ? k.pct : "";
-    return `<td class="sk st-${k.state}" style="--p:${k.pct}" title="${esc(tip)}">${txt}</td>`;
+    const k = s.st.skills[id], sk = SKILLS[id], unit = isUnit(id), rs = repShort(k);
+    const tip = `${skillName(id)} ${SKILLS[baseOf(id)].title}: ${k.pct}% · Learn ${k.stages.learn?"✓":"–"} · Practise ${k.practised}/${sk.practise.length}`
+      + (unit ? ` · Replicate ${k.rep.got}/${k.rep.of} task${k.rep.of===1?"":"s"} at Nearly there (${k.ap.got}/${k.ap.of} marks)` : ` · Apply ${k.ap.got}/${k.ap.of}`)
+      + (k.stages.check!==undefined ? ` · Checkpoint ${k.ck.of?`${k.ck.got}/${k.ck.of}`:"–"}` : "")
+      + (k.state==="tested" ? " · tested out" : "") + (k.catchUp ? " · Catch up: a later Python skill is already started" : "")
+      + (rs ? " · done from old Checkpoint answers, Replicate not finished" : "");
+    const txt = k.state==="done" ? (rs ? `✓ <small>${rs}</small>` : "✓") : k.state==="tested" ? "⚡" : k.catchUp ? "Catch up" : k.state==="prog" ? k.pct : "";
+    return `<td class="sk st-${k.state}${k.catchUp?" st-catch":""}${unit?" pc":""}" style="--p:${k.pct}" title="${esc(tip)}">${txt}</td>`;
   };
   const body = rows.map(s=>{
     const d = daysSince(s.updated);
@@ -314,7 +360,7 @@ function renderClass(cls){
       <td class="${d!==null && d>=F.inactiveDays || !s.hasRow ? "late" : ""}" title="${esc(stamp(s.updated))}">${when(s.updated)}</td>
       <td title="${lw ? esc(`${wk(s).days} of the last 7 days active, ${wk(s).saves} saves`) : "History not available"}">${lw ? `${wk(s).days}/7` : "–"}</td>
       <td>${s.hasRow ? `${s.st.level.n} · ${esc(s.st.level.title)}` : "–"}</td><td>${s.hasRow ? s.st.xp : "–"}</td>
-      <td>${s.hasRow ? `${s.st.done}/${live.length}` : "–"}</td><td>${s.hasRow ? s.st.overall+"%" : "–"}</td>
+      <td>${s.hasRow ? `${s.st.done}/${countedSkills().length}` : "–"}</td><td>${s.hasRow ? s.st.overall+"%" : "–"}</td>
       <td>${s.flags.length ? `<span class="tchip k-${s.flags[0].kind}">${s.flags.length}</span>` : ""}</td>
       ${live.map(id=>cell(s,id)).join("")}</tr>`;
   }).join("");
@@ -341,15 +387,19 @@ function renderClass(cls){
     </section>
     <section class="panel"><div class="ttop" style="margin:0 0 10px"><h2 style="margin:0">Progress by skill</h2><span class="spacer"></span><button class="btn" type="button" id="tcsv">⬇ Download class grid (Excel/CSV)</button></div>
       ${list.length ? `<div class="tgridwrap"><table class="tgrid"><caption class="sr-only">Progress for each student and skill</caption>
-        <thead><tr>${th("name","Student")}${th("active","Last active")}${th("week","Last 7 days","Days active in the last 7 days")}<th scope="col">Level</th>${th("xp","XP")}${th("done","Skills done","Checkpoint finished or tested out")}${th("overall","Overall")}${th("flags","🚩","Number of flags")}
-        ${live.map(id=>th(id, String(SKILLS[id].n), `Skill ${SKILLS[id].n}: ${SKILLS[id].title}`)).join("")}</tr></thead>
+        <thead><tr class="tgh">${th("name","Student","",two)}${th("active","Last active","",two)}${th("week","Last 7 days","Days active in the last 7 days",two)}<th scope="col" rowspan="2">Level</th>${th("xp","XP","",two)}${th("done","Skills done","Skills 1 onwards where the Python skill and its pseudocode unit are both finished (or tested out). Skill 0 isn't counted.",two)}${th("overall","Overall","",two)}${th("flags","🚩","Number of flags",two)}
+        ${groupHead}</tr><tr class="tsub">${subHead}</tr></thead>
         <tbody>${body}</tbody></table></div>
-      <div class="tlegend"><span><i style="background:var(--paper)"></i>Not started</span><span><i style="background:color-mix(in srgb,var(--amber) 25%,var(--paper))"></i>In progress (%)</span><span><i style="background:var(--green-w)"></i>✓ Checkpoint done</span><span><i style="background:var(--violet-w)"></i>⚡ Tested out</span><span>Hover a cell for details.</span></div>`
+      <div class="tlegend"><span><b>Py</b> Python skill · <b>Pc</b> its pseudocode unit</span><span><i style="background:var(--paper)"></i>Not started</span><span><i style="background:color-mix(in srgb,var(--amber) 25%,var(--paper))"></i>In progress (%)</span><span><i style="background:var(--green-w)"></i>✓ Checkpoint done</span><span><i style="background:var(--violet-w)"></i>⚡ Tested out</span><span><i style="background:var(--orange-w)"></i>Catch up: unit left behind</span><span><b>R1/2</b> unit done from old answers, Replicate tasks still to do</span><span>Hover a cell for details.</span></div>`
       : `<p class="tempty">No students in this class yet. Add logins with <code>node students.js add</code>.</p>`}
     </section>
     <p class="muted" style="font-size:.85rem">Marks are worked out in each student's browser, so treat them as a guide rather than exam evidence. Only signed-in work appears here.</p>
   </div>`;
   wireHeader();
+  // The second heading row (Py / Pc) sticks just below the first.
+  const grp = $(".tgrid thead th.tgrp");
+  const stickSub = () => { const g2 = $(".tgrid thead th.tgrp"); if (g2) document.querySelectorAll(".tgrid thead tr.tsub th").forEach(t=>t.style.top = g2.offsetHeight + "px"); };
+  if (grp) { stickSub(); if (window._stickSub) removeEventListener("resize", window._stickSub); window._stickSub = stickSub; addEventListener("resize", stickSub); }
   document.querySelectorAll("[data-sort]").forEach(b=>b.onclick=()=>{ const k=b.dataset.sort; S.sort = {key:k, dir: S.sort.key===k ? -S.sort.dir : (k==="name"?1:-1)}; store.set("ps-teacher-sort", S.sort); renderClass(cls); $(`[data-sort="${k}"]`)?.focus(); });
   // Redraw after the change event has finished (redrawing inside it removes the focused box mid-event),
   // then reopen the settings and put focus back where it was.
@@ -358,7 +408,7 @@ function renderClass(cls){
   $("#tflagreset").onclick = ()=>{ store.set("ps-teacher-flags", {}); redraw("#tflagreset"); };
   const csv = $("#tcsv"); if (csv) csv.onclick = ()=>{
     const head = ["Name","Username","Class","Last active","Days since active","Days active (last 7 days)","Saves (last 7 days)","Level","XP","Skills done","Overall %","Flags"];
-    live.forEach(id=>{ const n=SKILLS[id].n; head.push(`S${n} %`, `S${n} Apply`, `S${n} Checkpoint`); });
+    live.forEach(id=>{ const c=colLabel(id); head.push(`${c} %`, `${c} ${stageName(id,"apply")}`, `${c} Checkpoint`); });
     const out = [head, ...rows.map(s=>{
       const r = [s.name, s.username, s.cls, s.updated ? s.updated.toISOString().slice(0,10) : "Never", s.hasRow ? daysSince(s.updated) : "",
                  lw ? wk(s).days : "", lw ? wk(s).saves : "",
@@ -383,30 +433,33 @@ function renderStudent(id){
     const s = SKILLS[sid], p = stu.prog[sid], k = stu.st.skills[sid];
     const open = k.state==="prog" ? "open" : "";
     const practise = s.practise.map((q,i)=>{
-      const n = p.att[i]||0, res = p.practise[i] ? (p.first[i] ? `<span class="ok">✓ First time</span>` : `<span class="ok">✓ After ${n} tries</span>`) : n ? `<span class="bad">✗ ${n} ${n===1?"try":"tries"}</span>` : `<span class="tempty">Not tried</span>`;
+      const n = p.att[q.id]||0, res = p.practise[q.id] ? (p.first[q.id] ? `<span class="ok">✓ First time</span>` : `<span class="ok">✓ After ${n} tries</span>`) : n ? `<span class="bad">✗ ${n} ${n===1?"try":"tries"}</span>` : `<span class="tempty">Not tried</span>`;
       return `<tr><td>Q${i+1}</td><td>${esc(q.title)}</td><td>${res}</td></tr>`;
     }).join("");
     const apply = s.apply.map(a=>{
       const r = p.apply[a.id], n = p.tries[a.id]||0, code = p.drafts[a.id], at = p.draftAt[a.id];
       const score = r ? `<span class="${pctCls(100*r.got/r.of)}">${r.got}/${r.of}</span>` : `<span class="tempty">Not checked</span>`;
       return `<tr><td>${esc(a.title)}${p.low[a.id]==="notyet"?` <span class="tchip" title="Scored 'Not yet' at some point">had “Not yet”</span>`:""}</td><td class="num">${score}</td><td class="num">${n}</td>
-        <td>${code ? `<details class="tcode"><summary>View code${at?` (edited ${esc(stamp(new Date(at)))})`:""}</summary>${codeFig(code, "py")}</details>` : `<span class="tempty">No code saved</span>`}</td></tr>`;
+        <td>${code ? `<details class="tcode"><summary>View code${at?` (edited ${esc(stamp(new Date(at)))})`:""}</summary>${codeFig(code, isUnit(sid)||a.lang==="pc" ? "pc" : "py")}</details>` : `<span class="tempty">No code saved</span>`}</td></tr>`;
     }).join("");
     const check = s.check.map((q,i)=>{
-      const m = p.check[i];
+      const m = p.check[q.id];
       const res = m===undefined ? `<span class="tempty">Not answered</span>` : `<span class="${q.type==="selfmark"?"":pctCls(100*m/q.marks)}">${m}/${q.marks}</span>${q.type==="selfmark"?" <span class=\"muted\">(self-marked)</span>":""}`;
       return `<tr><td>Q${i+1}</td><td>${plain(q.prompt)}<br><span class="muted" style="font-size:.8rem">${esc(q.source==="exam-style"?"Exam-style":q.source||"")}</span></td><td class="num">${res}</td></tr>`;
     }).join("");
-    const chip = k.state==="done" ? `<span class="ok">✓ Done</span>` : k.state==="tested" ? `<span class="tchip k-behind">⚡ Tested out</span>` : k.state==="prog" ? `<span class="mid">In progress</span>` : `<span class="tempty">Not started</span>`;
-    return `<details class="tskill" ${open}><summary>Skill ${s.n} · ${esc(s.title)} ${chip}
-        <span class="muted">Learn ${k.stages.learn?"✓":"–"} · Practise ${k.practised}/${s.practise.length} · Apply ${k.ap.got}/${k.ap.of} · Checkpoint ${k.ck.of?`${k.ck.got}/${k.ck.of}`:"–"}</span><span class="pct">${k.pct}%</span></summary>
+    const chip = (k.state==="done" ? `<span class="ok">✓ Done</span>` : k.state==="tested" ? `<span class="tchip k-behind">⚡ Tested out</span>` : k.state==="prog" ? `<span class="mid">In progress</span>` : `<span class="tempty">Not started</span>`)
+      + (k.catchUp ? ` <span class="tchip" title="A later Python skill is already started">Catch up</span>` : "")
+      + (repShort(k) ? ` <span class="tchip" title="Counted as done from old Checkpoint answers; the Replicate tasks aren't finished">Replicate ${k.rep.got}/${k.rep.of}</span>` : "");
+    const ap = stageName(sid, "apply");   // "Replicate" in a unit
+    return `<details class="tskill" ${open}><summary>${skillName(sid)} · ${esc(SKILLS[baseOf(sid)].title)} ${chip}
+        <span class="muted">Learn ${k.stages.learn?"✓":"–"} · Practise ${k.practised}/${s.practise.length} · ${ap} ${k.ap.got}/${k.ap.of}${s.check.length ? ` · Checkpoint ${k.ck.of?`${k.ck.got}/${k.ck.of}`:"–"}` : ""}</span><span class="pct">${k.pct}%</span></summary>
       <div class="tbody">
         <h3 class="tsub">✏️ Practise <a class="muted" style="font-size:.8rem" href="?teacher#${sid}/practise">preview</a></h3>
         <table class="tlist"><thead><tr><th>#</th><th>Question</th><th>Result</th></tr></thead><tbody>${practise}</tbody></table>
-        <h3 class="tsub">💻 Apply <a class="muted" style="font-size:.8rem" href="?teacher#${sid}/apply">preview</a></h3>
+        <h3 class="tsub">💻 ${ap} <a class="muted" style="font-size:.8rem" href="?teacher#${sid}/apply">preview</a></h3>
         <table class="tlist"><thead><tr><th>Task</th><th class="num">Best</th><th class="num">Checks</th><th>Code</th></tr></thead><tbody>${apply}</tbody></table>
-        <h3 class="tsub">🎓 Checkpoint <a class="muted" style="font-size:.8rem" href="?teacher#${sid}/check">preview</a></h3>
-        <table class="tlist"><thead><tr><th>#</th><th>Question</th><th class="num">Mark</th></tr></thead><tbody>${check}</tbody></table>
+        ${s.check.length ? `<h3 class="tsub">🎓 Checkpoint <a class="muted" style="font-size:.8rem" href="?teacher#${sid}/check">preview</a></h3>
+        <table class="tlist"><thead><tr><th>#</th><th>Question</th><th class="num">Mark</th></tr></thead><tbody>${check}</tbody></table>` : ""}
       </div></details>`;
   }).join("");
 
@@ -419,7 +472,7 @@ function renderStudent(id){
       ${stu.hasRow ? `<div class="tcards" style="margin-top:12px">
         <div class="tcard"><b>${stu.st.level.n}</b><small>Level · ${esc(stu.st.level.title)}</small></div>
         <div class="tcard"><b>${stu.st.xp}</b><small>XP</small></div>
-        <div class="tcard"><b>${stu.st.done}/${liveSkills().length}</b><small>Skills done</small></div>
+        <div class="tcard" title="Skills 1 onwards with both the Python skill and its pseudocode unit finished (or tested out)"><b>${stu.st.done}/${countedSkills().length}</b><small>Skills done</small></div>
         <div class="tcard"><b>${stu.st.overall}%</b><small>Overall</small></div>
         <div class="tcard"><b>🔥 ${stu.st.best}</b><small>Best streak</small></div></div>` : `<p class="tempty">This student hasn't signed in yet, so there's no progress to show.</p>`}
       ${flags.length ? `<p style="margin:6px 0 0">${flags.map(f=>`<span class="tchip k-${f.kind}">${esc(f.text)}</span>`).join(" ")}</p>` : ""}
@@ -453,6 +506,7 @@ async function timeline(stu){
   if (!cached || Date.now()-cached.at > 120000){
     try {
       const rows = await getAll(`progress_daily?select=day,saves,data&user_id=eq.${encodeURIComponent(stu.id)}&order=day.asc`);
+      noteSnaps(rows.map(r=>r.data));
       cached = {at: Date.now(), snaps: rows.map(r=>({day: r.day, saves: r.saves, st: stats(cleanProgress(r.data))}))};
       S.tl.set(stu.id, cached);
     } catch(e){ return `<h2>📈 Timeline</h2><p class="tempty">${esc(histMessage(e))}</p>`; }
@@ -478,11 +532,11 @@ async function timeline(stu){
     const tested = firstDay(s=>s.st.skills[sid].state==="tested");
     if (!dates.some(Boolean) && !tested) return "";
     const ck = dates[3] ? cellFor(dates[3]) : tested ? (tested===base ? `<td class="by">⚡ tested out by ${esc(shortDate(tested))}</td>` : `<td>⚡ tested out ${esc(shortDate(tested))}</td>`) : cellFor(null);
-    return `<tr><td>Skill ${SKILLS[sid].n} · ${esc(SKILLS[sid].title)}</td>${dates.slice(0,3).map(cellFor).join("")}${ck}</tr>`;
+    return `<tr><td>${skillName(sid)} · ${esc(SKILLS[baseOf(sid)].title)}</td>${dates.slice(0,3).map(cellFor).join("")}${ck}</tr>`;
   }).join("");
 
   const pts = snaps.map(s=>({x: s.day, y: s.st.overall, tip: `${shortDate(s.day)}: ${s.st.overall}% overall, ${s.st.xp} XP, ${s.st.done} skill${s.st.done===1?"":"s"} done${s.saves ? `, ${s.saves} save${s.saves===1?"":"s"}` : " (starting point)"}`}));
-  return `<h2>📈 Timeline</h2>
+  return `<h2>📈 Timeline</h2>${unitsNote()}
     <h3 class="tsub">Activity, last ${WEEKS} weeks</h3>
     <div class="tstrip" aria-label="Days active in the last ${WEEKS} weeks">${strip}</div>
     <p class="muted" style="font-size:.85rem">${recent.length} day${recent.length===1?"":"s"} active, ${recent.reduce((n,s)=>n+s.saves,0)} saves. Each block is 7 days, newest on the right; hover a square for the date.</p>
@@ -497,6 +551,7 @@ async function loadWeekly(){
   if (S.weekly && Date.now()-S.weekly.at < 120000) return S.weekly;
   const from = histFrom(), rows = await getAll(`rpc/history_weekly?p_from=${from}&order=user_id,week`);
   const by = new Map();
+  noteSnaps(rows.map(r=>r.data));
   rows.forEach(r=>{ if (!by.has(r.user_id)) by.set(r.user_id, new Map()); by.get(r.user_id).set(r.week, stats(cleanProgress(r.data)).overall); });
   return S.weekly = {at: Date.now(), from, by};
 }
@@ -528,7 +583,7 @@ async function renderHistory(cls){
   const rows = [...list].sort((a,b)=>a.name.localeCompare(b.name)).map(s=>`<tr class="${s.hasRow?"":"never"}"><td class="tname"><a href="#teacher/student/${s.id}">${esc(s.name)}</a>${cls==="*"?` <span class="muted">${esc(s.cls)}</span>`:""}</td>
       ${weeks.map(w=>{ const v = actFor(s, w); return `<td class="wk ${v.days?"":"zero"}" style="--d:${v.days}" title="${esc(`${s.name}, ${weekLabel(w)}: ${v.days} day${v.days===1?"":"s"} active, ${v.saves} saves`)}">${v.days}</td>`; }).join("")}</tr>`).join("");
 
-  $("#app").innerHTML = `<div class="tdash">${header("history", cls)}
+  $("#app").innerHTML = `<div class="tdash">${header("history", cls)}${unitsNote()}
     <div class="tcards">
       <div class="tcard"><b>${now.active}</b><small>Active in the last 7 days (week before: ${prev.active})</small></div>
       <div class="tcard"><b>${now.days}</b><small>Student-days of work, last 7 days</small></div>
@@ -566,8 +621,8 @@ function renderQuestions(cls){
   const rowsFor = sid => {
     const s = SKILLS[sid];
     const pr = s.practise.map((q,i)=>{
-      const tried = list.filter(st=>(st.prog[sid].att[i]||0)>0), solved = tried.filter(st=>st.prog[sid].practise[i]), first = tried.filter(st=>st.prog[sid].first[i]);
-      const avgTries = tried.length ? (tried.reduce((n,st)=>n+st.prog[sid].att[i],0)/tried.length).toFixed(1) : "–";
+      const tried = list.filter(st=>(st.prog[sid].att[q.id]||0)>0), solved = tried.filter(st=>st.prog[sid].practise[q.id]), first = tried.filter(st=>st.prog[sid].first[q.id]);
+      const avgTries = tried.length ? (tried.reduce((n,st)=>n+st.prog[sid].att[q.id],0)/tried.length).toFixed(1) : "–";
       const r = {kind:"Practise", sid, label:`Q${i+1} ${q.title}`, n:tried.length, a:tried.length?Math.round(100*solved.length/tried.length):null, b:tried.length?Math.round(100*first.length/tried.length):null, c:avgTries, href:`?teacher#${sid}/practise`};
       r.score = r.b; items.push(r); return r;
     });
@@ -576,13 +631,13 @@ function renderQuestions(cls){
       const avg = done.length ? Math.round(done.reduce((n,st)=>n+100*st.prog[sid].apply[t.id].got/t.marks,0)/done.length) : null;
       const full = done.length ? Math.round(100*done.filter(st=>st.prog[sid].apply[t.id].got===t.marks).length/done.length) : null;
       const checks = done.length ? (done.reduce((n,st)=>n+(st.prog[sid].tries[t.id]||0),0)/done.length).toFixed(1) : "–";
-      const r = {kind:"Apply", sid, label:t.title, n:done.length, a:avg, b:full, c:checks, href:`?teacher#${sid}/apply`};
+      const r = {kind:stageName(sid,"apply"), sid, label:t.title, n:done.length, a:avg, b:full, c:checks, href:`?teacher#${sid}/apply`};
       r.score = avg; items.push(r); return r;
     });
     const ck = s.check.map((q,i)=>{
-      const done = list.filter(st=>st.prog[sid].check[i]!==undefined);
-      const avg = done.length ? Math.round(done.reduce((n,st)=>n+100*st.prog[sid].check[i]/q.marks,0)/done.length) : null;
-      const full = done.length ? Math.round(100*done.filter(st=>st.prog[sid].check[i]===q.marks).length/done.length) : null;
+      const done = list.filter(st=>st.prog[sid].check[q.id]!==undefined);
+      const avg = done.length ? Math.round(done.reduce((n,st)=>n+100*st.prog[sid].check[q.id]/q.marks,0)/done.length) : null;
+      const full = done.length ? Math.round(100*done.filter(st=>st.prog[sid].check[q.id]===q.marks).length/done.length) : null;
       const r = {kind:"Checkpoint", sid, label:`Q${i+1} ${String(q.prompt).replace(/<[^>]*>/g," ").replace(/\s+/g," ").trim().slice(0,70)}${q.type==="selfmark"?" (self-marked)":""}`, n:done.length, a:avg, b:full, c:"", href:`?teacher#${sid}/check`, self:q.type==="selfmark"};
       r.score = q.type==="selfmark" ? null : avg; items.push(r); return r;
     });
@@ -596,14 +651,14 @@ function renderQuestions(cls){
 
   $("#app").innerHTML = `<div class="tdash">${header("questions", cls)}
     <section class="panel"><div class="ttop" style="margin:0 0 6px"><h2 style="margin:0">🧗 Hardest questions</h2><span class="spacer"></span><button class="btn" type="button" id="tqcsv">⬇ Download analysis (Excel/CSV)</button></div>
-      <p class="muted">Lowest scores among questions at least ${minN} student${minN>1?"s":""} attempted. Practise uses “right first time”; Apply and Checkpoint use the average mark. Click a question to preview it.</p>
-      ${hardest.length ? `<table class="tlist"><thead><tr><th>Skill</th><th>Stage</th><th>Question</th><th class="num">Students</th><th class="num">Score</th></tr></thead><tbody>${hardest.map(r=>`<tr><td>${SKILLS[r.sid].n}</td><td>${r.kind}</td><td><a href="${r.href}">${esc(r.label)}</a></td><td class="num">${r.n}</td><td class="num">${pc(r.score)}</td></tr>`).join("")}</tbody></table>` : `<p class="tempty">Not enough answers yet.</p>`}
+      <p class="muted">Lowest scores among questions at least ${minN} student${minN>1?"s":""} attempted. Practise uses “right first time”; Apply, Replicate and Checkpoint use the average mark. Click a question to preview it.</p>
+      ${hardest.length ? `<table class="tlist"><thead><tr><th>Skill</th><th>Stage</th><th>Question</th><th class="num">Students</th><th class="num">Score</th></tr></thead><tbody>${hardest.map(r=>`<tr><td>${SKILLS[r.sid].n}${isUnit(r.sid)?" Pseudocode":""}</td><td>${r.kind}</td><td><a href="${r.href}">${esc(r.label)}</a></td><td class="num">${r.n}</td><td class="num">${pc(r.score)}</td></tr>`).join("")}</tbody></table>` : `<p class="tempty">Not enough answers yet.</p>`}
     </section>
     ${per.map(({sid,pr,ap,ck})=>{
       const s = SKILLS[sid], any = [...pr,...ap,...ck].some(r=>r.n);
-      return `<details class="tskill"><summary>Skill ${s.n} · ${esc(s.title)} <span class="muted">${any?"":"no answers yet"}</span></summary><div class="tbody">
+      return `<details class="tskill"><summary>${skillName(sid)} · ${esc(SKILLS[baseOf(sid)].title)} <span class="muted">${any?"":"no answers yet"}</span></summary><div class="tbody">
         <h3 class="tsub">✏️ Practise</h3>${table(["Question","Tried","Solved","Right first time","Avg tries"], pr, r=>`<td class="num">${r.n}</td><td class="num">${pc(r.a)}</td><td class="num">${pc(r.b)}</td><td class="num">${r.c}</td>`)}
-        <h3 class="tsub">💻 Apply</h3>${table(["Task","Checked","Avg mark","Full marks","Avg checks"], ap, r=>`<td class="num">${r.n}</td><td class="num">${pc(r.a)}</td><td class="num">${pc(r.b)}</td><td class="num">${r.c}</td>`)}
+        <h3 class="tsub">💻 ${stageName(sid,"apply")}</h3>${table(["Task","Checked","Avg mark","Full marks","Avg checks"], ap, r=>`<td class="num">${r.n}</td><td class="num">${pc(r.a)}</td><td class="num">${pc(r.b)}</td><td class="num">${r.c}</td>`)}
         <h3 class="tsub">🎓 Checkpoint</h3>${table(["Question","Answered","Avg mark","Full marks"], ck, r=>`<td class="num">${r.n}</td><td class="num">${pc(r.a)}</td><td class="num">${pc(r.b)}</td>`)}
       </div></details>`;
     }).join("")}
@@ -612,7 +667,7 @@ function renderQuestions(cls){
   wireHeader();
   $("#tqcsv").onclick = ()=>{
     const out = [["Skill","Skill title","Stage","Question","Students","Solved % / Avg mark %","Right first time % / Full marks %","Avg tries / checks"]];
-    items.forEach(r=>out.push([SKILLS[r.sid].n, SKILLS[r.sid].title, r.kind, r.label, r.n, r.a??"", r.b??"", r.c]));
+    items.forEach(r=>out.push([colLabel(r.sid), SKILLS[r.sid].title, r.kind, r.label, r.n, r.a??"", r.b??"", r.c]));
     download(`programming-skills-questions-${fileCls(cls)}-${fileDate()}.csv`, out);
   };
 }
